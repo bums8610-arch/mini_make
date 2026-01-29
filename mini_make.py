@@ -2,20 +2,14 @@
 from __future__ import annotations
 
 import os
-import re
 import json
-import time
 import random
-import gzip
-import urllib.request
-import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from urllib.parse import urljoin
-from html.parser import HTMLParser
-import html as html_lib
+
+from playwright.sync_api import sync_playwright
 
 
 @dataclass
@@ -49,182 +43,71 @@ def now_kst() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
 
 
-def fetch_html(url: str, timeout: int = 12) -> tuple[str, int, str]:
+RANKING_URL = "https://m.entertain.naver.com/ranking"
+
+
+def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
     """
-    return (final_url, status, html_text)
+    네이버 연예 랭킹 페이지를 '브라우저로' 열어서(자바스크립트 실행) 링크를 수집.
+    return: (title, article_url, ranking_page_url)
+    실패하면 예외 -> Actions 실패(디스코드 실패 알림)
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.naver.com/",
-        "Accept-Encoding": "gzip",
-    }
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    req = urllib.request.Request(url, headers=headers)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            final_url = resp.geturl()
-            status = getattr(resp, "status", 200)
-            raw = resp.read()
-            enc = (resp.headers.get("Content-Encoding") or "").lower()
-            if "gzip" in enc:
-                raw = gzip.decompress(raw)
-            text = raw.decode("utf-8", errors="ignore")
-            return final_url, status, text
-
-    except urllib.error.HTTPError as e:
         try:
-            raw = e.read()
-            enc = (getattr(e, "headers", {}) or {}).get("Content-Encoding", "")
-            if enc and "gzip" in str(enc).lower():
-                raw = gzip.decompress(raw)
-            body = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            body = ""
-        final_url = getattr(e, "url", url)
-        status = getattr(e, "code", 0) or 0
-        return final_url, status, body
+            print(f"[네이버] goto {RANKING_URL}")
+            page.goto(RANKING_URL, wait_until="networkidle", timeout=60000)
 
+            # a 태그 전부 뽑아서, '기사 링크'처럼 생긴 것만 필터링
+            items = page.evaluate(
+                """() => {
+                    const links = Array.from(document.querySelectorAll('a'));
+                    const out = [];
+                    for (const a of links) {
+                      const text = (a.innerText || '').trim().replace(/\\s+/g,' ');
+                      const href = a.href || '';
+                      if (!text || !href) continue;
 
-# ✅ 여기: JS 껍데기인 m.entertain 대신, n.news 연예 랭킹을 1순위로
-RANKING_URLS = [
-    "https://n.news.naver.com/entertain/ranking",
-    # 백업(가끔 n.news가 구조 바뀌면)
-    "https://m.entertain.naver.com/ranking",
-]
+                      const looksLikeArticle =
+                        href.includes('/home/article/') ||
+                        href.includes('/ranking/read') ||
+                        href.includes('n.news.naver.com/entertain/ranking/article/');
 
-
-class AnchorCollector(HTMLParser):
-    def __init__(self, base_url: str):
-        super().__init__()
-        self.base_url = base_url
-        self.in_a = False
-        self.current_href = ""
-        self.current_text_parts: list[str] = []
-        self.items: list[tuple[str, str]] = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "a":
-            self.in_a = True
-            self.current_href = ""
-            self.current_text_parts = []
-            for k, v in attrs:
-                if k.lower() == "href":
-                    self.current_href = v or ""
-
-    def handle_data(self, data):
-        if self.in_a and data:
-            s = data.strip()
-            if s:
-                self.current_text_parts.append(s)
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "a" and self.in_a:
-            self.in_a = False
-            title = " ".join(self.current_text_parts).strip()
-            href = (self.current_href or "").strip()
-            if not title or not href:
-                return
-
-            full = urljoin(self.base_url, href)
-
-            # ✅ n.news 연예 랭킹 기사 패턴
-            ok = "n.news.naver.com/entertain/ranking/article/" in full
-            # (백업) m.entertain 기사 패턴
-            ok = ok or ("m.entertain.naver.com/home/article/" in full) or ("/ranking/read" in full)
-
-            if ok and 6 <= len(title) <= 120:
-                self.items.append((title, full))
-
-
-def extract_from_next_data(html_text: str) -> list[tuple[str, str]]:
-    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.DOTALL)
-    if not m:
-        return []
-    raw = html_lib.unescape(m.group(1)).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return []
-
-    results: list[tuple[str, str]] = []
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            title = None
-            link = None
-            for tk in ("title", "headline", "articleTitle", "contentTitle", "subject"):
-                v = obj.get(tk)
-                if isinstance(v, str) and v.strip():
-                    title = v.strip()
-                    break
-            for lk in ("url", "link", "href", "mobileUrl"):
-                v = obj.get(lk)
-                if isinstance(v, str) and v.strip():
-                    link = v.strip()
-                    break
-            if isinstance(title, str) and isinstance(link, str):
-                if "n.news.naver.com/entertain/ranking/article/" in link or "m.entertain.naver.com" in link:
-                    results.append((re.sub(r"\s+", " ", title).strip(), link))
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-
-    walk(data)
-    uniq = {}
-    for t, u in results:
-        uniq[(t, u)] = True
-    return list(uniq.keys())
-
-
-def pick_topic_from_naver_entertain() -> tuple[str, str, str]:
-    last_status = None
-    last_url = None
-    last_html = ""
-
-    for base_url in RANKING_URLS:
-        for attempt in range(1, 4):
-            final_url, status, html_text = fetch_html(base_url, timeout=12)
-            last_status, last_url, last_html = status, final_url, html_text
-
-            print(f"[네이버] try={attempt}/3 url={base_url} final={final_url} status={status} html_len={len(html_text)}")
-
-            if status in (403, 429) or status >= 500 or status == 0:
-                time.sleep(1 + random.random() * 2)
-                continue
-
-            items = extract_from_next_data(html_text)
-
-            if not items:
-                p = AnchorCollector(final_url)
-                p.feed(html_text)
-                items = p.items
+                      if (looksLikeArticle && text.length >= 6 && text.length <= 120) {
+                        out.push({text, href});
+                      }
+                    }
+                    // 중복 제거
+                    const uniq = new Map();
+                    for (const x of out) uniq.set(x.text + '|' + x.href, x);
+                    return Array.from(uniq.values());
+                }"""
+            )
 
             print(f"[네이버] items={len(items)}")
 
-            if items:
-                title, url = random.choice(items)  # ✅ 랜덤 유지
-                return title, url, final_url
+            if not items:
+                # 디버그 저장
+                (out_dir / "naver_debug.html").write_text(page.content(), encoding="utf-8")
+                page.screenshot(path=str(out_dir / "naver_debug.png"), full_page=True)
+                raise RuntimeError("렌더링 후에도 기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
 
-            time.sleep(1 + random.random() * 2)
+            chosen = random.choice(items)  # ✅ 랜덤 유지
+            return chosen["text"], chosen["href"], RANKING_URL
 
-    out_dir = Path("outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dbg_path = out_dir / "naver_debug.html"
-    try:
-        dbg_path.write_text(last_html[:200000], encoding="utf-8")
-        print(f"[디버그] saved: {dbg_path}")
-    except Exception:
-        pass
-
-    raise RuntimeError(f"네이버 연예 랭킹에서 제목을 가져오지 못함. last_status={last_status} last_url={last_url}")
+        finally:
+            browser.close()
 
 
 def build_60s_shorts_script(topic: str) -> dict:
@@ -241,12 +124,8 @@ def build_60s_shorts_script(topic: str) -> dict:
 
 
 def node_load_inputs(ctx: dict):
-    title, article_url, src_url = pick_topic_from_naver_entertain()
-    ctx["inputs"] = {
-        "topic": title,
-        "source_url": article_url,
-        "ranking_page": src_url,
-    }
+    title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
+    ctx["inputs"] = {"topic": title, "source_url": article_url, "ranking_page": ranking_url}
 
 
 def node_make_script(ctx: dict):
@@ -293,7 +172,6 @@ def node_save_files(ctx: dict):
 def node_print(ctx: dict):
     print("TOPIC:", ctx["inputs"]["topic"])
     print("SOURCE_URL:", ctx["inputs"]["source_url"])
-    print("RANKING_PAGE:", ctx["inputs"]["ranking_page"])
     print("SCRIPT FILE:", ctx["outputs"]["script_path"])
     print("META FILE:", ctx["outputs"]["meta_path"])
 
