@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    env:
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,8 +26,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Playwright
+      - name: Install deps
         run: |
+          python -V
+          pip -V
+          pip install --upgrade pip
           pip install playwright
           python -m playwright install --with-deps chromium
 
@@ -33,14 +39,19 @@ jobs:
           echo "=== LIST ==="
           ls -la
           echo "=== HEAD mini_make.py ==="
-          sed -n '1,60p' mini_make.py
+          sed -n '1,80p' mini_make.py
           echo "=== GREP markers ==="
-          grep -n "HTTP_GET" mini_make.py || true
+          grep -n "sync_playwright" mini_make.py || true
           grep -n "m.entertain.naver.com/ranking" mini_make.py || true
 
-      - name: Run
+      - name: Run (capture stdout+stderr, fail if empty)
+        shell: bash
         run: |
-          python mini_make.py | tee run.log
+          set -euo pipefail
+          python -u mini_make.py 2>&1 | tee run.log
+          echo "=== run.log size ==="
+          ls -la run.log
+          test -s run.log || (echo "run.log is empty -> FAIL" >&2; exit 1)
 
       - name: Upload run log
         if: always()
@@ -48,14 +59,7 @@ jobs:
         with:
           name: run-log
           path: run.log
-
-      - name: Debug - show naver_debug.html
-        if: always()
-        run: |
-          echo "=== outputs dir ==="
-          ls -la outputs || true
-          echo "=== naver_debug.html head ==="
-          sed -n '1,160p' outputs/naver_debug.html || true
+          if-no-files-found: error
 
       - name: Upload outputs
         if: always()
@@ -63,11 +67,13 @@ jobs:
         with:
           name: outputs
           path: outputs/
+          if-no-files-found: warn
 
       - name: Notify failure (Discord)
         if: failure()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: bash
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
@@ -78,6 +84,7 @@ jobs:
         if: success()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: bash
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
