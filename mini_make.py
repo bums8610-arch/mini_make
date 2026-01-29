@@ -1,11 +1,12 @@
 # mini_make.py
 from __future__ import annotations
 
-import os
 import re
 import json
+import time
 import random
 import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -40,7 +41,7 @@ class Flow:
         cur = start
         while cur is not None:
             print(f"[실행] {cur}")
-            nxt = self.nodes[cur].fn(ctx)
+            nxt = self.nodes[cur].fn(ctx)  # 여기서 예외 나면 멈춤
             cur = nxt if isinstance(nxt, str) else self.links.get(cur)
         return ctx
 
@@ -52,26 +53,48 @@ def now_kst() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
 
 
-def fetch_html(url: str, timeout: int = 10) -> tuple[str, str]:
+def fetch_html(url: str, timeout: int = 12) -> tuple[str, int, str]:
+    """
+    returns: (final_url, status_code, html_text)
+    """
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
         ),
         "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.naver.com/",
+        "Upgrade-Insecure-Requests": "1",
     }
+
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        final_url = resp.geturl()
-        text = resp.read().decode("utf-8", errors="ignore")
-    return final_url, text
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final_url = resp.geturl()
+            status = getattr(resp, "status", 200)
+            text = resp.read().decode("utf-8", errors="ignore")
+            return final_url, status, text
+
+    except urllib.error.HTTPError as e:
+        # 403/429 같은 경우 여기로 옴
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        final_url = getattr(e, "url", url)
+        status = getattr(e, "code", 0) or 0
+        return final_url, status, body
 
 
 # ----------------------------
-# 네이버 엔터 랭킹에서 제목 1개 뽑기
+# 네이버 엔터 랭킹에서 제목 1개 뽑기(랜덤)
 # ----------------------------
-NAVER_ENT_RANKING_URL = "https://m.entertain.naver.com/ranking"
+RANKING_URLS = [
+    "https://m.entertain.naver.com/ranking",
+    "https://entertain.naver.com/ranking",
+]
 
 
 class AnchorCollector(HTMLParser):
@@ -94,19 +117,24 @@ class AnchorCollector(HTMLParser):
 
     def handle_data(self, data):
         if self.in_a and data:
-            self.current_text_parts.append(data.strip())
+            s = data.strip()
+            if s:
+                self.current_text_parts.append(s)
 
     def handle_endtag(self, tag):
         if tag.lower() == "a" and self.in_a:
             self.in_a = False
-            title = " ".join([t for t in self.current_text_parts if t]).strip()
-            href = self.current_href.strip()
+            title = " ".join(self.current_text_parts).strip()
+            href = (self.current_href or "").strip()
+            if not title or not href:
+                return
 
-            if title and href:
-                full = urljoin(self.base_url, href)
-                if ("/home/article/" in full) or ("/ranking/read" in full):
-                    if 6 <= len(title) <= 60:
-                        self.items.append((title, full))
+            full = urljoin(self.base_url, href)
+
+            # 너무 빡빡한 조건이면 못 잡으니 넓게 잡음(엔터 기사 링크/읽기 링크)
+            if "entertain.naver.com" in full and ("article" in full or "read" in full):
+                if 6 <= len(title) <= 80:
+                    self.items.append((title, full))
 
 
 def extract_from_next_data(html_text: str) -> list[tuple[str, str]]:
@@ -128,27 +156,21 @@ def extract_from_next_data(html_text: str) -> list[tuple[str, str]]:
             link = None
 
             for tk in ("title", "headline", "articleTitle", "contentTitle", "subject"):
-                if tk in obj and isinstance(obj[tk], str):
-                    title = obj[tk].strip()
-                    if title:
-                        break
+                v = obj.get(tk)
+                if isinstance(v, str) and v.strip():
+                    title = v.strip()
+                    break
 
             for lk in ("url", "link", "href", "mobileUrl"):
-                if lk in obj and isinstance(obj[lk], str):
-                    link = obj[lk].strip()
-                    if link:
-                        break
-
-            if not link:
-                oid = obj.get("oid") or obj.get("officeId")
-                aid = obj.get("aid") or obj.get("articleId")
-                if isinstance(oid, (str, int)) and isinstance(aid, (str, int)):
-                    link = f"https://m.entertain.naver.com/home/article/{oid}/{aid}"
+                v = obj.get(lk)
+                if isinstance(v, str) and v.strip():
+                    link = v.strip()
+                    break
 
             if isinstance(title, str) and isinstance(link, str):
-                if ("/home/article/" in link) or ("/ranking/read" in link):
-                    if 6 <= len(title) <= 60:
-                        results.append((title, link))
+                if "entertain.naver.com" in link and ("article" in link or "read" in link):
+                    if 6 <= len(title) <= 80:
+                        results.append((re.sub(r"\s+", " ", title).strip(), link))
 
             for v in obj.values():
                 walk(v)
@@ -159,75 +181,107 @@ def extract_from_next_data(html_text: str) -> list[tuple[str, str]]:
 
     walk(data)
 
+    # 중복 제거
     uniq = {}
     for t, u in results:
-        uniq[(re.sub(r"\s+", " ", t).strip(), u)] = True
+        uniq[(t, u)] = True
     return list(uniq.keys())
 
 
-def pick_topic_from_naver_entertain() -> tuple[str, str]:
+def pick_topic_from_naver_entertain() -> tuple[str, str, str]:
     """
-    항상 네이버 엔터 랭킹에서 주제를 가져온다.
-    실패하면 예외를 발생시켜 workflow를 실패 처리한다.
+    항상 네이버 엔터 랭킹에서 랜덤 1개 선택.
+    실패하면 예외(=워크플로 실패)로 처리.
+    return: (title, article_url, source_page_url)
     """
-    final_url, html_text = fetch_html(NAVER_ENT_RANKING_URL, timeout=12)
+    last_status = None
+    last_url = None
+    last_html = ""
 
-    items = extract_from_next_data(html_text)
-    if not items:
-        p = AnchorCollector(final_url)
-        p.feed(html_text)
-        items = p.items
+    for base_url in RANKING_URLS:
+        for attempt in range(1, 4):  # 3번 재시도
+            final_url, status, html_text = fetch_html(base_url, timeout=12)
+            last_status, last_url, last_html = status, final_url, html_text
 
-    if not items:
-        raise RuntimeError("네이버 엔터 랭킹에서 제목을 가져오지 못했습니다(페이지 구조/차단/일시 오류 가능).")
+            print(f"[네이버] try={attempt}/3 url={base_url} final={final_url} status={status} html_len={len(html_text)}")
 
-    return random.choice(items)
+            # 403/429/5xx면 잠깐 쉬고 재시도
+            if status in (403, 429) or status >= 500 or status == 0:
+                time.sleep(1 + random.random() * 2)
+                continue
+
+            # 파싱 시도 1: __NEXT_DATA__
+            items = extract_from_next_data(html_text)
+
+            # 파싱 시도 2: a 태그 텍스트
+            if not items:
+                p = AnchorCollector(final_url)
+                p.feed(html_text)
+                items = p.items
+
+            print(f"[네이버] items={len(items)}")
+
+            if items:
+                title, url = random.choice(items)  # 랜덤 유지
+                return title, url, final_url
+
+            time.sleep(1 + random.random() * 2)
+
+    # 디버그용 HTML 저장(Artifacts로 확인 가능)
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dbg_path = out_dir / "naver_debug.html"
+    try:
+        dbg_path.write_text(last_html[:200000], encoding="utf-8")  # 너무 커지지 않게 200KB만
+        print(f"[디버그] saved: {dbg_path}")
+    except Exception:
+        pass
+
+    raise RuntimeError(f"네이버 엔터 랭킹에서 제목을 가져오지 못함. last_status={last_status} last_url={last_url}")
 
 
 # ----------------------------
-# 쇼츠 대본 생성(예시)
+# 쇼츠 대본(예시)
 # ----------------------------
 def build_60s_shorts_script(topic: str) -> dict:
-    hook = f"3초만에 핵심만: {topic}"
-    problem = f"사람들이 {topic}에서 자주 놓치는 포인트가 있습니다."
-    tip1 = "1) 제목을 한 문장으로 요약해서 시작."
-    tip2 = "2) 핵심 3가지만 말하고 나머지는 버림."
-    tip3 = "3) 마지막 5초에 다음 행동(구독/댓글)을 딱 1개만 요청."
-    recap = "정리: 한 문장 요약 → 핵심 3개 → 행동 1개."
-    cta = "이런 방식으로 매일 자동으로 만들고 싶으면 구독."
-
     narration = "\n".join([
-        f"[훅 0-2s] {hook}",
-        f"[문제 2-10s] {problem}",
-        f"[핵심1 10-23s] {tip1}",
-        f"[핵심2 23-36s] {tip2}",
-        f"[핵심3 36-45s] {tip3}",
-        f"[요약 45-55s] {recap}",
-        f"[CTA 55-60s] {cta}",
+        f"[훅 0-2s] 오늘 연예 랭킹: {topic}",
+        "[문제 2-10s] 왜 이게 1분만에 퍼졌는지 핵심만.",
+        "[핵심1 10-25s] 첫째, 제목에서 사람들이 멈춰섬.",
+        "[핵심2 25-40s] 둘째, 댓글/공유 포인트가 명확함.",
+        "[핵심3 40-50s] 셋째, 다음 뉴스까지 이어지는 흐름.",
+        "[요약 50-57s] 제목-포인트-흐름 3개만 보면 됨.",
+        "[CTA 57-60s] 내일 랭킹도 자동으로 뽑아줄게. 구독.",
     ])
-
-    hashtags = ["#연예", "#뉴스", "#쇼츠", "#자동화"]
-    return {"topic": topic, "narration": narration, "hashtags": hashtags}
+    return {
+        "topic": topic,
+        "narration": narration,
+        "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"],
+    }
 
 
 # ----------------------------
 # 노드들
 # ----------------------------
 def node_load_inputs(ctx: dict):
-    # 항상 네이버 랭킹에서만 주제 선택 (강제 주제 입력 기능 삭제)
-    title, url = pick_topic_from_naver_entertain()
-    ctx["inputs"] = {"topic": title, "source": "naver_entertain_ranking", "source_url": url}
+    # 항상 네이버에서 가져오기(랜덤)
+    title, article_url, src_url = pick_topic_from_naver_entertain()
+    ctx["inputs"] = {
+        "topic": title,
+        "source": "naver_entertain_ranking",
+        "source_url": article_url,
+        "ranking_page": src_url,
+    }
 
 
 def node_make_script(ctx: dict):
-    topic = ctx["inputs"]["topic"]
-    ctx["shorts"] = build_60s_shorts_script(topic)
+    ctx["shorts"] = build_60s_shorts_script(ctx["inputs"]["topic"])
 
 
 def node_save_files(ctx: dict):
     kst = now_kst()
-    run_id = os.getenv("GITHUB_RUN_ID", "local")  # 파일 이름 구분용(없으면 local)
     stamp = kst.strftime("%Y%m%d_%H%M")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
 
     out_dir = Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -235,14 +289,14 @@ def node_save_files(ctx: dict):
     script_path = out_dir / f"shorts_{stamp}_{run_id}.txt"
     meta_path = out_dir / f"shorts_{stamp}_{run_id}.json"
 
-    shorts = ctx["shorts"]
     src = ctx["inputs"]
+    shorts = ctx["shorts"]
 
     txt = []
     txt.append(f"DATE(KST): {kst.isoformat()}")
-    txt.append(f"SOURCE: {src.get('source')}")
-    txt.append(f"SOURCE_URL: {src.get('source_url')}")
     txt.append(f"TOPIC: {shorts['topic']}")
+    txt.append(f"SOURCE_URL: {src['source_url']}")
+    txt.append(f"RANKING_PAGE: {src['ranking_page']}")
     txt.append("")
     txt.append(shorts["narration"])
     txt.append("")
@@ -252,8 +306,7 @@ def node_save_files(ctx: dict):
     meta = {
         "date_kst": kst.isoformat(),
         "run_id": run_id,
-        "source": src.get("source"),
-        "source_url": src.get("source_url"),
+        **src,
         **shorts,
         "files": {"script": str(script_path), "meta": str(meta_path)},
     }
@@ -264,7 +317,8 @@ def node_save_files(ctx: dict):
 
 def node_print(ctx: dict):
     print("TOPIC:", ctx["inputs"]["topic"])
-    print("TOPIC_URL:", ctx["inputs"]["source_url"])
+    print("SOURCE_URL:", ctx["inputs"]["source_url"])
+    print("RANKING_PAGE:", ctx["inputs"]["ranking_page"])
     print("SCRIPT FILE:", ctx["outputs"]["script_path"])
     print("META FILE:", ctx["outputs"]["meta_path"])
 
@@ -285,4 +339,3 @@ flow.connect("SAVE_FILES", "PRINT")
 if __name__ == "__main__":
     ctx = flow.run("LOAD_INPUTS")
     print("\n[끝] inputs =", ctx.get("inputs"))
-
