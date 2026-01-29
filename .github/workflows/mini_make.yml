@@ -13,12 +13,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     env:
       PYTHONUNBUFFERED: "1"
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: "gpt-5.2"
-      OPENAI_MAX_OUTPUT_TOKENS: "900"
 
     steps:
       - name: Checkout
@@ -33,13 +29,14 @@ jobs:
         run: |
           python -V
           pip install --upgrade pip
-          pip install playwright openai
+          pip install playwright
           python -m playwright install --with-deps chromium
 
       - name: Run (capture stdout+stderr)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p outputs
           python -u mini_make.py 2>&1 | tee run.log
           test -s run.log || (echo "run.log empty -> FAIL" >&2; exit 1)
 
