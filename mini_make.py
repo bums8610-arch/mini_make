@@ -105,7 +105,6 @@ def _extract_items_from_json(obj) -> list[dict[str, str]]:
         if title and url and "entertain.naver.com" in url:
             out.append({"title": title, "url": url})
 
-    # dedupe
     uniq = {}
     for it in out:
         uniq[it["title"] + "|" + it["url"]] = it
@@ -160,16 +159,14 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
         page.on("response", on_response)
 
         try:
-            print(f"[네이버] goto {RANKING_URL}", flush=True)
+            log(f"[네이버] goto {RANKING_URL}")
             page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
-            # 스크롤로 추가 로딩 유도(3번)
             for _ in range(3):
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1200)
 
-            # DOM에서 링크 수집(상대경로까지 처리)
             dom_items = page.evaluate(
                 """() => {
                     const out = [];
@@ -190,12 +187,10 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                     for (const x of out) uniq.set(x.title + '|' + x.url, x);
                     return Array.from(uniq.values());
                 }"""
-            )
+            ) or []
 
-            dom_items = dom_items or []
-            print(f"[네이버] dom_items={len(dom_items)}", flush=True)
+            log(f"[네이버] dom_items={len(dom_items)}")
 
-            # __NEXT_DATA__ 같은 내장 JSON도 추출
             next_data_text = page.evaluate(
                 """() => {
                     const el = document.querySelector('#__NEXT_DATA__');
@@ -211,7 +206,6 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                 except Exception:
                     next_items = []
 
-            # 네트워크 JSON 응답에서 모은 것도 합치기
             json_items_dedup = {it["title"] + "|" + it["url"]: it for it in (json_items or [])}
             next_items_dedup = {it["title"] + "|" + it["url"]: it for it in (next_items or [])}
             dom_items_dedup = {it["title"] + "|" + it["url"]: it for it in (dom_items or [])}
@@ -222,9 +216,8 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
             all_map.update(dom_items_dedup)
             all_items = list(all_map.values())
 
-            print(
-                f"[네이버] items(dom/json/next)={len(dom_items)}/{len(json_items_dedup)}/{len(next_items_dedup)} -> total={len(all_items)}",
-                flush=True,
+            log(
+                f"[네이버] items(dom/json/next)={len(dom_items)}/{len(json_items_dedup)}/{len(next_items_dedup)} -> total={len(all_items)}"
             )
 
             if not all_items:
@@ -239,6 +232,41 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
         finally:
             context.close()
             browser.close()
+
+
+# ---------------------------
+# 기사 메타(brief) 추출 (NameError 방지용으로 반드시 존재)
+# ---------------------------
+def fetch_article_brief(url: str) -> dict[str, str]:
+    """
+    기사 페이지에서 og:title / og:description 정도만 뽑아 '대본 재료'로 사용.
+    실패해도 빈 값 반환(파이프라인은 계속 진행)
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul")
+            page = context.new_page()
+
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1200)
+
+            def meta(selector: str) -> str:
+                el = page.query_selector(selector)
+                return (el.get_attribute("content") or "").strip() if el else ""
+
+            og_title = meta("meta[property='og:title']")
+            og_desc = meta("meta[property='og:description']") or meta("meta[name='description']")
+
+            context.close()
+            browser.close()
+
+            return {"og_title": og_title, "og_description": og_desc}
+    except Exception:
+        return {"og_title": "", "og_description": ""}
 
 
 # ---------------------------
@@ -300,10 +328,10 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "t": {"type": "string"},         # 0-2s ...
-                        "voice": {"type": "string"},     # 내레이션
-                        "onscreen": {"type": "string"},  # 화면 자막(짧게)
-                        "broll": {"type": "string"},     # 비롤 아이디어(짧게)
+                        "t": {"type": "string"},
+                        "voice": {"type": "string"},
+                        "onscreen": {"type": "string"},
+                        "broll": {"type": "string"},
                     },
                     "required": ["t", "voice", "onscreen", "broll"],
                 },
@@ -371,7 +399,6 @@ def node_load_inputs(ctx: dict[str, Any]):
 def node_make_script(ctx: dict[str, Any]):
     inp = ctx["inputs"]
 
-    # OpenAI 키가 있으면 OpenAI로 생성, 실패하면 template로 fallback
     if os.getenv("OPENAI_API_KEY"):
         try:
             ctx["shorts"] = build_60s_shorts_script_openai(inp)
@@ -406,7 +433,6 @@ def node_save_files(ctx: dict[str, Any]):
     txt.append(f"ARTICLE_OG_DESC: {src.get('article_brief', {}).get('og_description', '')}")
     txt.append("")
 
-    # beats 기반 출력(따옴표 충돌 방지)
     if isinstance(shorts.get("beats"), list) and len(shorts["beats"]) == 6:
         for b in shorts["beats"]:
             txt.append(f'[{b["t"]}] {b["voice"]}')
@@ -417,7 +443,6 @@ def node_save_files(ctx: dict[str, Any]):
         txt.append("DESCRIPTION: " + (shorts.get("description") or ""))
         txt.append("NOTES: " + (shorts.get("notes") or ""))
     else:
-        # 혹시 구조가 다르면 notes/narration만이라도 기록
         txt.append(shorts.get("notes", "") or shorts.get("narration", ""))
 
     txt.append("")
@@ -467,3 +492,4 @@ if __name__ == "__main__":
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         raise
+
