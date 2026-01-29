@@ -2,40 +2,84 @@ name: mini_make_daily
 
 on:
   schedule:
-    - cron: "7 0 * * *"  # UTC 00:07 = KST 09:07
-  workflow_dispatch: {}  # 수동 실행 버튼
+    - cron: "7 0 * * *"   # UTC 00:07 = KST 09:07
+  workflow_dispatch: {}
+
+concurrency:
+  group: mini-make
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-          - name: Install Playwright
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
         run: |
           pip install playwright
           python -m playwright install --with-deps chromium
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-                - name: Debug - show which file is running
+      - name: Debug - show which file is running
         run: |
           echo "=== LIST ==="
           ls -la
           echo "=== HEAD mini_make.py ==="
-          sed -n '1,40p' mini_make.py
+          sed -n '1,60p' mini_make.py
           echo "=== GREP markers ==="
-          grep -n "HTTP_GET" -n mini_make.py || true
-          grep -n "m.entertain.naver.com/ranking" -n mini_make.py || true
+          grep -n "HTTP_GET" mini_make.py || true
+          grep -n "m.entertain.naver.com/ranking" mini_make.py || true
 
       - name: Run
-        run: python mini_make.py
-        
+        run: |
+          python mini_make.py | tee run.log
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: run.log
+
       - name: Debug - show naver_debug.html
         if: always()
         run: |
           echo "=== outputs dir ==="
           ls -la outputs || true
           echo "=== naver_debug.html head ==="
-          sed -n '1,120p' outputs/naver_debug.html || true
+          sed -n '1,160p' outputs/naver_debug.html || true
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: outputs/
+
+      - name: Notify failure (Discord)
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\":\"❌ mini_make 실패! 확인 링크: $RUN_URL\"}" \
+            "$DISCORD_WEBHOOK"
+
+      - name: Notify success (Discord)
+        if: success()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
+            "$DISCORD_WEBHOOK"
