@@ -20,12 +20,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run
+           - name: Run
         run: |
-          python mini_make.py | tee run.log
+          python mini_make.py
+          exit 1
 
       - name: Upload log
         uses: actions/upload-artifact@v4
         with:
           name: run-log
           path: run.log
+      - name: Notify failure (Discord)
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\":\"❌ mini_make 실패! 여기 눌러서 확인: $RUN_URL\"}" \
+            "$DISCORD_WEBHOOK"
