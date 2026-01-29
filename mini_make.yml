@@ -9,6 +9,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+          - name: Install Playwright
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
