@@ -14,5 +14,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+                - name: Debug - show which file is running
+        run: |
+          echo "=== LIST ==="
+          ls -la
+          echo "=== HEAD mini_make.py ==="
+          sed -n '1,40p' mini_make.py
+          echo "=== GREP markers ==="
+          grep -n "HTTP_GET" -n mini_make.py || true
+          grep -n "m.entertain.naver.com/ranking" -n mini_make.py || true
+
       - name: Run
         run: python mini_make.py
