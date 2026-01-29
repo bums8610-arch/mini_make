@@ -2,7 +2,9 @@ name: mini_make_daily
 
 on:
   schedule:
-    - cron: "7 0 * * *"   # UTC 00:07 = KST 09:07
+    # KST 09:00, 11:00, 14:00, 17:00, 22:00
+    # UTC = KST - 9  => 00:00, 02:00, 05:00, 08:00, 13:00
+    - cron: "0 0,2,5,8,13 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -17,7 +19,8 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: "gpt-5.2"
+      # 필요하면 모델만 바꿔서 사용
+      OPENAI_MODEL: "gpt-4.1-mini"
       OPENAI_MAX_OUTPUT_TOKENS: "900"
 
     steps:
