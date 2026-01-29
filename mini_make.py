@@ -47,11 +47,6 @@ RANKING_URL = "https://m.entertain.naver.com/ranking"
 
 
 def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
-    """
-    네이버 연예 랭킹 페이지를 '브라우저로' 열어서(자바스크립트 실행) 링크를 수집.
-    return: (title, article_url, ranking_page_url)
-    실패하면 예외 -> Actions 실패(디스코드 실패 알림)
-    """
     out_dir = Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,27 +62,40 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
         try:
             print(f"[네이버] goto {RANKING_URL}")
-            page.goto(RANKING_URL, wait_until="networkidle", timeout=60000)
 
-            # a 태그 전부 뽑아서, '기사 링크'처럼 생긴 것만 필터링
+            # 1) networkidle 대신 domcontentloaded
+            page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
+
+            # 2) 랭킹 기사 링크가 생길 때까지 기다림(15초)
+            page.wait_for_selector(
+                "a[href*='/home/article/'], a[href*='/ranking/read'], a[href*='/article/']",
+                timeout=15000
+            )
+
+            # 3) 링크 수집(필터를 넓게)
             items = page.evaluate(
                 """() => {
                     const links = Array.from(document.querySelectorAll('a'));
                     const out = [];
                     for (const a of links) {
-                      const text = (a.innerText || '').trim().replace(/\\s+/g,' ');
                       const href = a.href || '';
-                      if (!text || !href) continue;
+                      if (!href) continue;
 
-                      const looksLikeArticle =
-                        href.includes('/home/article/') ||
-                        href.includes('/ranking/read') ||
-                        href.includes('n.news.naver.com/entertain/ranking/article/');
+                      const t1 = (a.innerText || '').trim();
+                      const t2 = (a.textContent || '').trim();
+                      const text = (t1 || t2).replace(/\\s+/g,' ').trim();
+                      if (!text) continue;
 
-                      if (looksLikeArticle && text.length >= 6 && text.length <= 120) {
+                      // 넓게: 엔터 기사/랭킹 읽기 링크면 통과
+                      const looksLike =
+                        href.includes('entertain.naver.com') &&
+                        (href.includes('/article/') || href.includes('/home/article/') || href.includes('/ranking/read'));
+
+                      if (looksLike && text.length >= 6 && text.length <= 120) {
                         out.push({text, href});
                       }
                     }
+
                     // 중복 제거
                     const uniq = new Map();
                     for (const x of out) uniq.set(x.text + '|' + x.href, x);
@@ -98,12 +106,11 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
             print(f"[네이버] items={len(items)}")
 
             if not items:
-                # 디버그 저장
                 (out_dir / "naver_debug.html").write_text(page.content(), encoding="utf-8")
                 page.screenshot(path=str(out_dir / "naver_debug.png"), full_page=True)
                 raise RuntimeError("렌더링 후에도 기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
 
-            chosen = random.choice(items)  # ✅ 랜덤 유지
+            chosen = random.choice(items)  # 랜덤 유지
             return chosen["text"], chosen["href"], RANKING_URL
 
         finally:
@@ -189,3 +196,4 @@ flow.connect("SAVE_FILES", "PRINT")
 if __name__ == "__main__":
     ctx = flow.run("LOAD_INPUTS")
     print("\n[끝] inputs =", ctx.get("inputs"))
+
