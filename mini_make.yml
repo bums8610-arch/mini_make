@@ -13,7 +13,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     env:
       PYTHONUNBUFFERED: "1"
 
@@ -29,29 +28,17 @@ jobs:
       - name: Install deps
         run: |
           python -V
-          pip -V
           pip install --upgrade pip
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Debug - show which file is running
-        run: |
-          echo "=== LIST ==="
-          ls -la
-          echo "=== HEAD mini_make.py ==="
-          sed -n '1,80p' mini_make.py
-          echo "=== GREP markers ==="
-          grep -n "sync_playwright" mini_make.py || true
-          grep -n "m.entertain.naver.com/ranking" mini_make.py || true
-
-      - name: Run (capture stdout+stderr, fail if empty)
+      - name: Run (capture stdout+stderr)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p outputs
           python -u mini_make.py 2>&1 | tee run.log
-          echo "=== run.log size ==="
-          ls -la run.log
-          test -s run.log || (echo "run.log is empty -> FAIL" >&2; exit 1)
+          test -s run.log || (echo "run.log empty -> FAIL" >&2; exit 1)
 
       - name: Upload run log
         if: always()
@@ -90,3 +77,4 @@ jobs:
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
             "$DISCORD_WEBHOOK"
+
