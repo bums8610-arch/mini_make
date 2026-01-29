@@ -1,11 +1,12 @@
 name: mini_make_daily
 
 on:
+  # GitHub Actions schedule은 UTC 기준
+  # KST 09:00, 11:00, 14:00, 17:00, 22:00
+  # UTC 00:00, 02:00, 05:00, 08:00, 13:00
   schedule:
-    # 매일 KST 09:00, 11:00, 14:00, 17:00, 22:00
-    # (UTC로는 00:00, 02:00, 05:00, 08:00, 13:00)
     - cron: "0 0,2,5,8,13 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {} # 수동 실행 버튼
 
 concurrency:
   group: mini-make
@@ -15,21 +16,26 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-           - name: Run
+
+      - name: Run
         run: |
-          python mini_make.py
-          exit 1
+          python mini_make.py | tee run.log
 
       - name: Upload log
         uses: actions/upload-artifact@v4
         with:
           name: run-log
           path: run.log
+
       - name: Notify failure (Discord)
         if: failure()
         env:
@@ -37,5 +43,16 @@ jobs:
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
-            -d "{\"content\":\"❌ mini_make 실패! 여기 눌러서 확인: $RUN_URL\"}" \
+            -d "{\"content\":\"❌ mini_make 실패! 확인 링크: $RUN_URL\"}" \
             "$DISCORD_WEBHOOK"
+
+      - name: Notify success (Discord)
+        if: success()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
+            "$DISCORD_WEBHOOK"
+
