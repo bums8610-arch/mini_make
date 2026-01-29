@@ -1,0 +1,18 @@
+name: mini_make_daily
+
+on:
+  schedule:
+    - cron: "7 0 * * *"   # UTC 00:07 = KST 09:07
+  workflow_dispatch: {}   # 이게 있어야 Run workflow 버튼이 생김
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run
+        run: python mini_make.py
