@@ -2,8 +2,14 @@ name: mini_make_daily
 
 on:
   schedule:
-    - cron: "7 0 * * *"   # UTC 00:07 = KST 09:07
-  workflow_dispatch: {}   # 이게 있어야 Run workflow 버튼이 생김
+    # 매일 KST 09:00, 11:00, 14:00, 17:00, 22:00
+    # (UTC로는 00:00, 02:00, 05:00, 08:00, 13:00)
+    - cron: "0 0,2,5,8,13 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: mini-make
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -16,3 +22,4 @@ jobs:
           python-version: "3.12"
       - name: Run
         run: python mini_make.py
+
