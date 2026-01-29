@@ -64,106 +64,181 @@ class Flow:
 # ---------------------------
 # 네이버: 랜덤 토픽 1개 뽑기
 # ---------------------------
+def _walk_json(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+
+def _extract_items_from_json(obj) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for node in _walk_json(obj):
+        if not isinstance(node, dict):
+            continue
+
+        title = None
+        for k in ("title", "headline", "articleTitle", "subject", "newsTitle", "name"):
+            v = node.get(k)
+            if isinstance(v, str):
+                s = v.strip()
+                if 6 <= len(s) <= 120:
+                    title = s
+                    break
+
+        url = None
+        for k in ("url", "link", "href", "mobileUrl", "pcUrl"):
+            v = node.get(k)
+            if isinstance(v, str) and v.strip().startswith("http"):
+                url = v.strip()
+                break
+
+        if not url:
+            oid = node.get("oid") or node.get("officeId")
+            aid = node.get("aid") or node.get("articleId")
+            if oid and aid:
+                url = f"https://m.entertain.naver.com/home/article/{oid}/{aid}"
+
+        if title and url and "entertain.naver.com" in url:
+            out.append({"title": title, "url": url})
+
+    # dedupe
+    uniq = {}
+    for it in out:
+        uniq[it["title"] + "|" + it["url"]] = it
+    return list(uniq.values())
+
+
 def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
     """
-    네이버 연예 랭킹 페이지를 '브라우저로' 열어서(자바스크립트 실행) 기사 링크 수집
-    return: (title, article_url, ranking_page_url)
+    1) DOM에서 링크 수집(스크롤 포함)
+    2) 실패하면 __NEXT_DATA__/JSON 응답에서 제목/링크 추출
+    3) 그래도 실패하면 outputs에 디버그 저장
     """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    json_urls: list[str] = []
+    json_items: list[dict[str, str]] = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
-        page = browser.new_page(
+        context = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 1280, "height": 720},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
             ),
-            locale="ko-KR",
         )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        page = context.new_page()
+
+        def on_response(resp):
+            try:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "application/json" in ct:
+                    json_urls.append(resp.url)
+                    try:
+                        data = resp.json()
+                        json_items.extend(_extract_items_from_json(data))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
         try:
-            log(f"[네이버] goto {RANKING_URL}")
+            print(f"[네이버] goto {RANKING_URL}", flush=True)
             page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
-            # 기사 링크가 생길 때까지 기다림
-            page.wait_for_selector(
-                "a[href*='/home/article/'], a[href*='/ranking/read'], a[href*='/article/']",
-                timeout=15000,
-            )
+            # 스크롤로 추가 로딩 유도(3번)
+            for _ in range(3):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1200)
 
-            items = page.evaluate(
+            # DOM에서 링크 수집(상대경로까지 처리)
+            dom_items = page.evaluate(
                 """() => {
-                    const links = Array.from(document.querySelectorAll('a'));
                     const out = [];
+                    const links = Array.from(document.querySelectorAll('a'));
                     for (const a of links) {
-                      const href = a.href || '';
-                      if (!href) continue;
-
-                      const raw = (a.innerText || a.textContent || '');
-                      const text = raw.trim().replace(/\\s+/g, ' ');
-                      if (!text) continue;
+                      const rawHref = a.getAttribute('href') || '';
+                      const href = rawHref ? new URL(rawHref, location.origin).href : '';
+                      const text = ((a.innerText || a.textContent || '')).trim().replace(/\\s+/g,' ');
+                      if (!href || !text) continue;
 
                       const okDomain = href.includes('entertain.naver.com');
-                      const okPath =
-                        href.includes('/article/') ||
-                        href.includes('/home/article/') ||
-                        href.includes('/ranking/read');
-
+                      const okPath = href.includes('/article/') || href.includes('/home/article/') || href.includes('/ranking/read');
                       if (okDomain && okPath && text.length >= 6 && text.length <= 120) {
-                        out.push({ text, href });
+                        out.push({title: text, url: href});
                       }
                     }
-
-                    // 중복 제거
                     const uniq = new Map();
-                    for (const x of out) uniq.set(x.text + '|' + x.href, x);
+                    for (const x of out) uniq.set(x.title + '|' + x.url, x);
                     return Array.from(uniq.values());
                 }"""
             )
 
-            log(f"[네이버] items={len(items)}")
+            dom_items = dom_items or []
+            print(f"[네이버] dom_items={len(dom_items)}", flush=True)
 
-            if not items:
-                OUT_DIR.mkdir(parents=True, exist_ok=True)
+            # __NEXT_DATA__ 같은 내장 JSON도 추출
+            next_data_text = page.evaluate(
+                """() => {
+                    const el = document.querySelector('#__NEXT_DATA__');
+                    return el ? el.textContent : '';
+                }"""
+            )
+
+            next_items: list[dict[str, str]] = []
+            if next_data_text and isinstance(next_data_text, str) and len(next_data_text) > 50:
+                try:
+                    next_json = json.loads(next_data_text)
+                    next_items = _extract_items_from_json(next_json)
+                except Exception:
+                    next_items = []
+
+            # 네트워크 JSON 응답에서 모은 것도 합치기
+            json_items_dedup = {it["title"] + "|" + it["url"]: it for it in (json_items or [])}
+            next_items_dedup = {it["title"] + "|" + it["url"]: it for it in (next_items or [])}
+            dom_items_dedup = {it["title"] + "|" + it["url"]: it for it in (dom_items or [])}
+
+            all_map = {}
+            all_map.update(json_items_dedup)
+            all_map.update(next_items_dedup)
+            all_map.update(dom_items_dedup)
+            all_items = list(all_map.values())
+
+            print(
+                f"[네이버] items(dom/json/next)={len(dom_items)}/{len(json_items_dedup)}/{len(next_items_dedup)} -> total={len(all_items)}",
+                flush=True,
+            )
+
+            if not all_items:
                 (OUT_DIR / "naver_debug.html").write_text(page.content(), encoding="utf-8")
                 page.screenshot(path=str(OUT_DIR / "naver_debug.png"), full_page=True)
-                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
+                (OUT_DIR / "naver_json_urls.txt").write_text("\n".join(json_urls[:500]), encoding="utf-8")
+                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 및 naver_json_urls.txt 확인 필요")
 
-            chosen = random.choice(items)
-            return chosen["text"], chosen["href"], RANKING_URL
+            chosen = random.choice(all_items)
+            return chosen["title"], chosen["url"], RANKING_URL
 
         finally:
+            context.close()
             browser.close()
-
-
-def fetch_article_brief(url: str) -> dict[str, str]:
-    """
-    기사 페이지에서 og:title / og:description 정도만 뽑아 '대본 재료'로 사용.
-    실패해도 빈 값 반환(파이프라인은 계속 진행)
-    """
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            page = browser.new_page(locale="ko-KR")
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1200)
-
-            def meta(selector: str) -> str:
-                el = page.query_selector(selector)
-                return (el.get_attribute("content") or "").strip() if el else ""
-
-            og_title = meta("meta[property='og:title']")
-            og_desc = meta("meta[property='og:description']") or meta("meta[name='description']")
-
-            browser.close()
-            return {"og_title": og_title, "og_description": og_desc}
-
-    except Exception:
-        return {"og_title": "", "og_description": ""}
 
 
 # ---------------------------
