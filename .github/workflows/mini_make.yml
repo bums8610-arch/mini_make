@@ -1,12 +1,9 @@
 name: mini_make_daily
 
 on:
-  # GitHub Actions schedule은 UTC 기준
-  # KST 09:00, 11:00, 14:00, 17:00, 22:00
-  # UTC 00:00, 02:00, 05:00, 08:00, 13:00
   schedule:
-    - cron: "0 0,2,5,8,13 * * *"
-  workflow_dispatch: {} # 수동 실행 버튼
+    - cron: "7 0 * * *"   # UTC 00:07 = KST 09:07
+  workflow_dispatch: {}
 
 concurrency:
   group: mini-make
@@ -17,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    env:
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,20 +26,54 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run
+      - name: Install deps
         run: |
-          python mini_make.py | tee run.log
+          python -V
+          pip -V
+          pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Upload log
+      - name: Debug - show which file is running
+        run: |
+          echo "=== LIST ==="
+          ls -la
+          echo "=== HEAD mini_make.py ==="
+          sed -n '1,80p' mini_make.py
+          echo "=== GREP markers ==="
+          grep -n "sync_playwright" mini_make.py || true
+          grep -n "m.entertain.naver.com/ranking" mini_make.py || true
+
+      - name: Run (capture stdout+stderr, fail if empty)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u mini_make.py 2>&1 | tee run.log
+          echo "=== run.log size ==="
+          ls -la run.log
+          test -s run.log || (echo "run.log is empty -> FAIL" >&2; exit 1)
+
+      - name: Upload run log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-log
           path: run.log
+          if-no-files-found: error
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: outputs/
+          if-no-files-found: warn
 
       - name: Notify failure (Discord)
         if: failure()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: bash
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
@@ -50,9 +84,11 @@ jobs:
         if: success()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: bash
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
             "$DISCORD_WEBHOOK"
+
 
