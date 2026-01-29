@@ -14,6 +14,26 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 
+# ---------------------------
+# 공통 유틸
+# ---------------------------
+OUT_DIR = Path("outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RANKING_URL = "https://m.entertain.naver.com/ranking"
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def now_kst() -> datetime:
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
+
+
+# ---------------------------
+# mini make (flow)
+# ---------------------------
 @dataclass
 class Node:
     name: str
@@ -32,32 +52,28 @@ class Flow:
         self.links[a] = b
 
     def run(self, start: str):
-        ctx: dict = {}
+        ctx: dict[str, Any] = {}
         cur = start
         while cur is not None:
-            print(f"[실행] {cur}", flush=True)
+            log(f"[실행] {cur}")
             nxt = self.nodes[cur].fn(ctx)
             cur = nxt if isinstance(nxt, str) else self.links.get(cur)
         return ctx
 
 
-def now_kst() -> datetime:
-    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
-
-
-OUT_DIR = Path("outputs")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-RANKING_URL = "https://m.entertain.naver.com/ranking"
-
-
+# ---------------------------
+# 네이버: 랜덤 토픽 1개 뽑기
+# ---------------------------
 def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
     """
-    네이버 연예 랭킹 페이지를 '브라우저로' 열어서(자바스크립트 실행) 링크를 수집.
+    네이버 연예 랭킹 페이지를 '브라우저로' 열어서(자바스크립트 실행) 기사 링크 수집
     return: (title, article_url, ranking_page_url)
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         page = browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -65,15 +81,15 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
             ),
             locale="ko-KR",
         )
-
         try:
-            print(f"[네이버] goto {RANKING_URL}", flush=True)
+            log(f"[네이버] goto {RANKING_URL}")
             page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
 
             # 기사 링크가 생길 때까지 기다림
             page.wait_for_selector(
                 "a[href*='/home/article/'], a[href*='/ranking/read'], a[href*='/article/']",
-                timeout=15000
+                timeout=15000,
             )
 
             items = page.evaluate(
@@ -81,29 +97,38 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                     const links = Array.from(document.querySelectorAll('a'));
                     const out = [];
                     for (const a of links) {
-                      const text = ((a.innerText || a.textContent || '')).trim().replace(/\\s+/g,' ');
                       const href = a.href || '';
-                      if (!text || !href) continue;
+                      if (!href) continue;
+
+                      const raw = (a.innerText || a.textContent || '');
+                      const text = raw.trim().replace(/\\s+/g, ' ');
+                      if (!text) continue;
 
                       const okDomain = href.includes('entertain.naver.com');
-                      const okPath = href.includes('/article/') || href.includes('/home/article/') || href.includes('/ranking/read');
+                      const okPath =
+                        href.includes('/article/') ||
+                        href.includes('/home/article/') ||
+                        href.includes('/ranking/read');
+
                       if (okDomain && okPath && text.length >= 6 && text.length <= 120) {
-                        out.push({text, href});
+                        out.push({ text, href });
                       }
                     }
+
+                    // 중복 제거
                     const uniq = new Map();
                     for (const x of out) uniq.set(x.text + '|' + x.href, x);
                     return Array.from(uniq.values());
                 }"""
             )
 
-            print(f"[네이버] items={len(items)}", flush=True)
+            log(f"[네이버] items={len(items)}")
 
             if not items:
                 OUT_DIR.mkdir(parents=True, exist_ok=True)
                 (OUT_DIR / "naver_debug.html").write_text(page.content(), encoding="utf-8")
                 page.screenshot(path=str(OUT_DIR / "naver_debug.png"), full_page=True)
-                raise RuntimeError("렌더링 후에도 기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
+                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
 
             chosen = random.choice(items)
             return chosen["text"], chosen["href"], RANKING_URL
@@ -114,12 +139,15 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 def fetch_article_brief(url: str) -> dict[str, str]:
     """
-    기사 페이지에서 og:title / og:description 정도만 뽑아 대본 재료로 사용.
-    실패하면 빈 값 반환(파이프라인은 계속 진행)
+    기사 페이지에서 og:title / og:description 정도만 뽑아 '대본 재료'로 사용.
+    실패해도 빈 값 반환(파이프라인은 계속 진행)
     """
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
             page = browser.new_page(locale="ko-KR")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1200)
@@ -133,31 +161,53 @@ def fetch_article_brief(url: str) -> dict[str, str]:
 
             browser.close()
             return {"og_title": og_title, "og_description": og_desc}
+
     except Exception:
         return {"og_title": "", "og_description": ""}
 
 
-def build_60s_shorts_script_template(topic: str) -> dict:
-    narration = "\n".join([
-        f"[훅 0-2s] 오늘 연예 랭킹: {topic}",
-        "[문제 2-10s] 왜 이게 급상승했는지 핵심만.",
-        "[핵심1 10-25s] 제목에서 사람들이 멈춤.",
-        "[핵심2 25-40s] 댓글/공유 포인트가 명확함.",
-        "[핵심3 40-50s] 다음 이슈로 이어지는 흐름.",
-        "[요약 50-57s] 제목-포인트-흐름 3개만 보면 됨.",
-        "[CTA 57-60s] 내일 랭킹도 자동으로 뽑아줄게. 구독.",
-    ])
-    return {"topic": topic, "narration": narration, "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"]}
+# ---------------------------
+# 대본 생성: 템플릿(백업)
+# ---------------------------
+def build_60s_shorts_script_template(topic: str) -> dict[str, Any]:
+    narration = "\n".join(
+        [
+            f"[훅 0-2s] 오늘 연예 랭킹: {topic}",
+            "[문제 2-10s] 왜 이게 급상승했는지 핵심만.",
+            "[핵심1 10-25s] 제목에서 사람들이 멈춤.",
+            "[핵심2 25-40s] 댓글/공유 포인트가 명확함.",
+            "[핵심3 40-55s] 다음 이슈로 이어지는 흐름.",
+            "[CTA 55-60s] 내일 랭킹도 자동으로 뽑아줄게. 구독.",
+        ]
+    )
+    return {
+        "topic": topic,
+        "title_short": topic[:28],
+        "description": "네이버 연예 랭킹 기준 60초 요약",
+        "beats": [
+            {"t": "0-2s", "voice": f"오늘 연예 랭킹, {topic}.", "onscreen": "오늘의 랭킹", "broll": "랭킹 화면"},
+            {"t": "2-10s", "voice": "왜 뜨는지 핵심만 볼게요.", "onscreen": "왜 뜸?", "broll": "키워드 카드"},
+            {"t": "10-25s", "voice": "제목에서 사람들이 멈추는 포인트가 있어요.", "onscreen": "포인트 1", "broll": "제목 클로즈업"},
+            {"t": "25-40s", "voice": "댓글/공유가 생기는 지점이 명확합니다.", "onscreen": "포인트 2", "broll": "댓글 스크롤"},
+            {"t": "40-55s", "voice": "다음 이슈로 이어질 가능성도 보여요.", "onscreen": "포인트 3", "broll": "타임라인 그래픽"},
+            {"t": "55-60s", "voice": "내일 랭킹도 1분 요약할게요. 구독!", "onscreen": "구독", "broll": "구독 버튼"},
+        ],
+        "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"],
+        "notes": narration,
+        "_generator": "template",
+    }
 
 
+# ---------------------------
+# 대본 생성: OpenAI 협업(메인)
+# ---------------------------
 def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     """
-    OpenAI와 협업: 입력(제목/짧은 설명/링크)을 주면
-    6구간(0-60s) 대본/자막/비롤/해시태그를 '구조화 JSON'으로 생성.
+    OPENAI_API_KEY 환경변수가 있으면 OpenAI로 대본 생성(구조화 JSON).
     """
     from openai import OpenAI
 
-    model = os.getenv("OPENAI_MODEL", "gpt-5.2")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     max_out = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 
     client = OpenAI()
@@ -175,10 +225,10 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "t": {"type": "string"},
-                        "voice": {"type": "string"},
-                        "onscreen": {"type": "string"},
-                        "broll": {"type": "string"},
+                        "t": {"type": "string"},         # 0-2s ...
+                        "voice": {"type": "string"},     # 내레이션
+                        "onscreen": {"type": "string"},  # 화면 자막(짧게)
+                        "broll": {"type": "string"},     # 비롤 아이디어(짧게)
                     },
                     "required": ["t", "voice", "onscreen", "broll"],
                 },
@@ -190,11 +240,12 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
     system = (
-        "너는 한국어 유튜브 쇼츠(약 60초) 전문 대본 작가다. "
+        "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다. "
         "사용자가 준 정보(제목/짧은 설명/링크) 밖의 사실을 단정하지 말고, "
-        "정보가 부족하면 '기사 제목/요약 기준'처럼 표현해라. "
-        "과장, 단정적 루머, 비방은 피하고 호기심/맥락 중심으로 써라. "
-        "정확히 6개 구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s)으로 구성해라."
+        "정보가 부족하면 '기사 제목/요약 기준'이라고 표현해라. "
+        "과장, 루머, 비방은 피하고 맥락/포인트 중심으로 써라. "
+        "정확히 6구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s)으로 구성해라. "
+        "각 구간 voice는 짧고 말로 읽기 좋게, onscreen은 12자 이내로 써라."
     )
 
     user_payload = {
@@ -204,7 +255,7 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         "article_brief": inputs.get("article_brief", {}),
     }
 
-    response = client.responses.create(
+    resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": system},
@@ -222,13 +273,18 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         reasoning={"effort": "low"},
     )
 
-    data = json.loads(response.output_text)
+    data = json.loads(resp.output_text)
+    data["_generator"] = "openai"
     return data
 
 
-def node_load_inputs(ctx: dict):
+# ---------------------------
+# 노드 구현
+# ---------------------------
+def node_load_inputs(ctx: dict[str, Any]):
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
     brief = fetch_article_brief(article_url)
+
     ctx["inputs"] = {
         "topic": title,
         "source_url": article_url,
@@ -237,27 +293,28 @@ def node_load_inputs(ctx: dict):
     }
 
 
-def node_make_script(ctx: dict):
-    # 키가 있으면 OpenAI 사용, 실패하면 템플릿 fallback
+def node_make_script(ctx: dict[str, Any]):
+    inp = ctx["inputs"]
+
+    # OpenAI 키가 있으면 OpenAI로 생성, 실패하면 template로 fallback
     if os.getenv("OPENAI_API_KEY"):
         try:
-            ctx["shorts"] = build_60s_shorts_script_openai(ctx["inputs"])
-            ctx["shorts"]["_generator"] = "openai"
+            ctx["shorts"] = build_60s_shorts_script_openai(inp)
             return
         except Exception as e:
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             (OUT_DIR / "openai_error.txt").write_text(str(e), encoding="utf-8")
 
-    ctx["shorts"] = build_60s_shorts_script_template(ctx["inputs"]["topic"])
-    ctx["shorts"]["_generator"] = "template"
+    ctx["shorts"] = build_60s_shorts_script_template(inp["topic"])
 
 
-def node_save_files(ctx: dict):
+def node_save_files(ctx: dict[str, Any]):
     kst = now_kst()
     stamp = kst.strftime("%Y%m%d_%H%M")
     run_id = os.getenv("GITHUB_RUN_ID", "local")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
     meta_path = OUT_DIR / f"shorts_{stamp}_{run_id}.json"
 
@@ -265,4 +322,73 @@ def node_save_files(ctx: dict):
     shorts = ctx["shorts"]
 
     txt: list[str] = []
-    txt.append(f"DATE(KST): {kst.isofo
+    txt.append(f"DATE(KST): {kst.isoformat()}")
+    txt.append(f"GENERATOR: {shorts.get('_generator')}")
+    txt.append(f"TOPIC: {shorts.get('topic')}")
+    txt.append(f"SOURCE_URL: {src['source_url']}")
+    txt.append(f"RANKING_PAGE: {src['ranking_page']}")
+    txt.append(f"ARTICLE_OG_TITLE: {src.get('article_brief', {}).get('og_title', '')}")
+    txt.append(f"ARTICLE_OG_DESC: {src.get('article_brief', {}).get('og_description', '')}")
+    txt.append("")
+
+    # beats 기반 출력(따옴표 충돌 방지)
+    if isinstance(shorts.get("beats"), list) and len(shorts["beats"]) == 6:
+        for b in shorts["beats"]:
+            txt.append(f'[{b["t"]}] {b["voice"]}')
+            txt.append(f'  - ONSCREEN: {b["onscreen"]}')
+            txt.append(f'  - BROLL: {b["broll"]}')
+        txt.append("")
+        txt.append("TITLE_SHORT: " + (shorts.get("title_short") or ""))
+        txt.append("DESCRIPTION: " + (shorts.get("description") or ""))
+        txt.append("NOTES: " + (shorts.get("notes") or ""))
+    else:
+        # 혹시 구조가 다르면 notes/narration만이라도 기록
+        txt.append(shorts.get("notes", "") or shorts.get("narration", ""))
+
+    txt.append("")
+    txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
+
+    script_path.write_text("\n".join(txt), encoding="utf-8")
+
+    meta = {
+        "date_kst": kst.isoformat(),
+        "run_id": run_id,
+        "inputs": src,
+        "shorts": shorts,
+        "files": {"script": str(script_path), "meta": str(meta_path)},
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ctx["outputs"] = {"script_path": str(script_path), "meta_path": str(meta_path)}
+
+
+def node_print(ctx: dict[str, Any]):
+    log("TOPIC: " + ctx["inputs"]["topic"])
+    log("SOURCE_URL: " + ctx["inputs"]["source_url"])
+    log("GENERATOR: " + str(ctx["shorts"].get("_generator")))
+    log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
+    log("META FILE: " + ctx["outputs"]["meta_path"])
+
+
+# ---------------------------
+# 연결
+# ---------------------------
+flow = Flow()
+flow.add(Node("LOAD_INPUTS", node_load_inputs))
+flow.add(Node("MAKE_SCRIPT", node_make_script))
+flow.add(Node("SAVE_FILES", node_save_files))
+flow.add(Node("PRINT", node_print))
+
+flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
+flow.connect("MAKE_SCRIPT", "SAVE_FILES")
+flow.connect("SAVE_FILES", "PRINT")
+
+
+if __name__ == "__main__":
+    try:
+        ctx = flow.run("LOAD_INPUTS")
+        log("\n[끝] inputs = " + json.dumps(ctx.get("inputs"), ensure_ascii=False))
+    except Exception:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        raise
