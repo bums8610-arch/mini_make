@@ -18,10 +18,18 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
+
+      # ✅ OpenAI 키: GitHub Secrets의 OPENAI_API_KEY를 그대로 주입
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
       # 필요하면 모델만 바꿔서 사용
       OPENAI_MODEL: "gpt-4.1-mini"
       OPENAI_MAX_OUTPUT_TOKENS: "900"
+
+      # (선택) 이미지 수집을 쓴다면 아래 키도 Secrets에 추가해서 사용
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+      IMAGE_PROVIDER: "auto"
 
     steps:
       - name: Checkout
@@ -33,16 +41,27 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
+        shell: bash
         run: |
+          set -euo pipefail
           python -V
           pip -V
           pip install --upgrade pip
-          pip install playwright openai
+
+          # requirements.txt가 있으면 그걸 우선 설치
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install openai playwright
+          fi
+
+          # Playwright Chromium 설치
           python -m playwright install --with-deps chromium
 
       - name: Check OpenAI key exists (safe)
         shell: bash
         run: |
+          set -euo pipefail
           if [ -n "${OPENAI_API_KEY:-}" ]; then
             echo "OPENAI_API_KEY is set"
           else
@@ -80,6 +99,11 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         shell: bash
         run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK not set -> skip"
+            exit 0
+          fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"❌ mini_make 실패! 확인 링크: $RUN_URL\"}" \
@@ -91,6 +115,11 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         shell: bash
         run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK not set -> skip"
+            exit 0
+          fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
