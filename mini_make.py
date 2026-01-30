@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
+
 
 
 
@@ -729,4 +731,5 @@ if __name__ == "__main__":
     except Exception:
         (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         raise
+
 
