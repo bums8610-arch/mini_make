@@ -18,18 +18,11 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-
-      # ✅ OpenAI 키: GitHub Secrets의 OPENAI_API_KEY를 그대로 주입
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-      # 필요하면 모델만 바꿔서 사용
       OPENAI_MODEL: "gpt-4.1-mini"
       OPENAI_MAX_OUTPUT_TOKENS: "900"
-
-      # (선택) 이미지 수집을 쓴다면 아래 키도 Secrets에 추가해서 사용
-      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-      IMAGE_PROVIDER: "auto"
+      USE_OPENAI: "1"
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - name: Checkout
@@ -47,15 +40,7 @@ jobs:
           python -V
           pip -V
           pip install --upgrade pip
-
-          # requirements.txt가 있으면 그걸 우선 설치
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install openai playwright
-          fi
-
-          # Playwright Chromium 설치
+          pip install openai playwright
           python -m playwright install --with-deps chromium
 
       - name: Check OpenAI key exists (safe)
@@ -65,8 +50,7 @@ jobs:
           if [ -n "${OPENAI_API_KEY:-}" ]; then
             echo "OPENAI_API_KEY is set"
           else
-            echo "OPENAI_API_KEY is NOT set"
-            exit 1
+            echo "OPENAI_API_KEY is NOT set -> template fallback will be used"
           fi
 
       - name: Run (capture stdout+stderr)
@@ -95,8 +79,6 @@ jobs:
 
       - name: Notify failure (Discord)
         if: failure()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         shell: bash
         run: |
           set -euo pipefail
@@ -111,8 +93,6 @@ jobs:
 
       - name: Notify success (Discord)
         if: success()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         shell: bash
         run: |
           set -euo pipefail
