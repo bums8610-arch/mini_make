@@ -6,29 +6,55 @@ import json
 import random
 import re
 import traceback
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import sync_playwright
 
 # ===========================
-# 설정
+# 기본 설정
 # ===========================
 OUT_DIR = Path("outputs")
+IMG_DIR = OUT_DIR / "images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+IMG_DIR.mkdir(parents=True, exist_ok=True)
 
 RANKING_URL = "https://m.entertain.naver.com/ranking"
 
+# 대본 분량(문자수) 보정 범위
 VOICE_CHARS_MIN = int(os.getenv("VOICE_CHARS_MIN", "360"))
 VOICE_CHARS_MAX = int(os.getenv("VOICE_CHARS_MAX", "620"))
 
-# 스타일 고정하고 싶으면 env로 지정: SHORTS_STYLE=timeline
-SHORTS_STYLE = os.getenv("SHORTS_STYLE", "").strip().lower()
+# OpenAI 모델(텍스트 대본)
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 
+# OpenAI TTS
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # docs: audio/speech :contentReference[oaicite:2]{index=2}
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")           # 추천 voice 예시 :contentReference[oaicite:3]{index=3}
+OPENAI_TTS_INSTRUCTIONS = os.getenv(
+    "OPENAI_TTS_INSTRUCTIONS",
+    "한국어 뉴스 쇼츠 톤. 또박또박, 과장 없이, 빠르지 않게."
+)
 
+# 이미지(Pexels)
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+IMAGES_PER_BEAT = int(os.getenv("IMAGES_PER_BEAT", "1"))  # 기본 1장/구간
+PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "15"))
+
+# 비디오(쇼츠) 해상도
+W, H = 1080, 1920
+FPS = 30
+
+# ===========================
+# 유틸
+# ===========================
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -43,8 +69,54 @@ def _clean_text(s: str) -> str:
     return s
 
 
+def _write_text(path: Path, s: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(s, encoding="utf-8")
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
+    req = Request(url, headers=headers or {})
+    with urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8"))
+
+
+def _http_download(url: str, out_path: Path, headers: dict[str, str] | None = None, timeout: int = 60) -> None:
+    req = Request(url, headers=headers or {})
+    with urlopen(req, timeout=timeout) as resp:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(resp.read())
+
+
+def parse_time_range(t: str) -> tuple[float, float]:
+    # "10-25s" -> (10, 25)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*s\s*$", t)
+    if not m:
+        raise ValueError(f"Bad time range: {t}")
+    return float(m.group(1)), float(m.group(2))
+
+
+def srt_ts(seconds: float) -> str:
+    # 12.34 -> "00:00:12,340"
+    if seconds < 0:
+        seconds = 0
+    ms = int(round(seconds * 1000))
+    hh = ms // 3600000
+    ms %= 3600000
+    mm = ms // 60000
+    ms %= 60000
+    ss = ms // 1000
+    ms %= 1000
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
 # ===========================
-# mini make (flow)
+# mini make flow
 # ===========================
 @dataclass
 class Node:
@@ -74,8 +146,7 @@ class Flow:
 
 
 # ===========================
-# 네이버: 랭킹에서 랜덤 토픽 1개 뽑기
-# (DOM + NEXT_DATA + 네트워크 JSON 폴백)
+# 네이버 랭킹: 랜덤 기사 선택
 # ===========================
 def _walk_json(obj):
     if isinstance(obj, dict):
@@ -125,19 +196,13 @@ def _extract_items_from_json(obj) -> list[dict[str, str]]:
 
 
 def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    json_urls: list[str] = []
     json_items: list[dict[str, str]] = []
+    json_urls: list[str] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(
             locale="ko-KR",
@@ -171,12 +236,10 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
             page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
-            # 스크롤로 추가 로딩 유도
             for _ in range(3):
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1200)
 
-            # DOM에서 링크 수집(상대경로 처리)
             dom_items = page.evaluate(
                 """() => {
                     const out = [];
@@ -198,16 +261,13 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                     return Array.from(uniq.values());
                 }"""
             ) or []
-            log(f"[네이버] dom_items={len(dom_items)}")
 
-            # __NEXT_DATA__도 파싱
             next_data_text = page.evaluate(
                 """() => {
                     const el = document.querySelector('#__NEXT_DATA__');
                     return el ? el.textContent : '';
                 }"""
             )
-
             next_items: list[dict[str, str]] = []
             if isinstance(next_data_text, str) and len(next_data_text) > 50:
                 try:
@@ -216,26 +276,22 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                 except Exception:
                     next_items = []
 
-            # 합치고 중복 제거
-            json_items_dedup = {it["title"] + "|" + it["url"]: it for it in (json_items or [])}
-            next_items_dedup = {it["title"] + "|" + it["url"]: it for it in (next_items or [])}
-            dom_items_dedup = {it["title"] + "|" + it["url"]: it for it in (dom_items or [])}
-
             all_map = {}
-            all_map.update(json_items_dedup)
-            all_map.update(next_items_dedup)
-            all_map.update(dom_items_dedup)
+            for it in (json_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
+            for it in (next_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
+            for it in (dom_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
             all_items = list(all_map.values())
 
-            log(
-                f"[네이버] items(dom/json/next)={len(dom_items)}/{len(json_items_dedup)}/{len(next_items_dedup)} -> total={len(all_items)}"
-            )
+            log(f"[네이버] items={len(all_items)}")
 
             if not all_items:
-                (OUT_DIR / "naver_debug.html").write_text(page.content(), encoding="utf-8")
+                _write_text(OUT_DIR / "naver_debug.html", page.content())
                 page.screenshot(path=str(OUT_DIR / "naver_debug.png"), full_page=True)
-                (OUT_DIR / "naver_json_urls.txt").write_text("\n".join(json_urls[:500]), encoding="utf-8")
-                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 및 naver_json_urls.txt 확인 필요")
+                _write_text(OUT_DIR / "naver_json_urls.txt", "\n".join(json_urls[:500]))
+                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
 
             chosen = random.choice(all_items)
             return chosen["title"], chosen["url"], RANKING_URL
@@ -246,17 +302,13 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 
 # ===========================
-# 기사 컨텍스트(OG + 본문 일부) 추출
+# 기사 컨텍스트(OG + 본문 일부)
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1280, "height": 720})
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
@@ -273,14 +325,7 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
                       return el ? (el.getAttribute('content') || '') : '';
                     }
                     function pickBody() {
-                      const selectors = [
-                        '#articleBodyContents',
-                        'div#dic_area',
-                        'div._article_content',
-                        'div.article_body',
-                        'article',
-                        'main'
-                      ];
+                      const selectors = ['#articleBodyContents','div#dic_area','div._article_content','div.article_body','article','main'];
                       let best = '';
                       for (const sel of selectors) {
                         const el = document.querySelector(sel);
@@ -307,11 +352,10 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
             body_text = (data.get("body_text", "") or "").replace("\u00a0", " ")
             body_text = re.sub(r"\s+\n", "\n", body_text)
             body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
-
             body_excerpt = _clean_text(body_text)[:1800]
 
             if not og_title and not og_description and len(body_excerpt) < 40:
-                (OUT_DIR / "article_debug.html").write_text(page.content(), encoding="utf-8")
+                _write_text(OUT_DIR / "article_debug.html", page.content())
                 page.screenshot(path=str(OUT_DIR / "article_debug.png"), full_page=True)
 
             return {
@@ -327,20 +371,18 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
 
 
 # ===========================
-# 대본 생성: 템플릿(백업)
+# 대본 생성(템플릿 백업)
 # ===========================
 def build_60s_shorts_script_template(topic: str, article_ctx: dict[str, Any]) -> dict[str, Any]:
     hint = (article_ctx.get("og_description") or "").strip()[:60]
-
     beats = [
-        {"t": "0-2s", "voice": f"오늘 연예 랭킹, {topic}.", "onscreen": "오늘의 랭킹", "broll": "랭킹 화면"},
-        {"t": "2-10s", "voice": "핵심만 1분으로 정리합니다.", "onscreen": "1분 요약", "broll": "키워드 카드"},
-        {"t": "10-25s", "voice": (hint and f"기사 요약 힌트: {hint}." or "제목에서 포인트를 먼저 잡아볼게요."), "onscreen": "포인트", "broll": "제목 클로즈업"},
-        {"t": "25-40s", "voice": "사람들이 멈춰보는 지점이 있어요.", "onscreen": "반응 포인트", "broll": "댓글/공유"},
-        {"t": "40-55s", "voice": "자세한 내용은 기사 확인이 가장 안전합니다.", "onscreen": "기사 확인", "broll": "기사 화면"},
-        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 요약. 구독!", "onscreen": "구독", "broll": "구독 버튼"},
+        {"t": "0-2s",   "voice": f"오늘 연예 랭킹, {topic}.", "onscreen": "오늘의 랭킹", "broll": "ranking screen"},
+        {"t": "2-10s",  "voice": "핵심만 1분으로 정리합니다.", "onscreen": "1분 요약", "broll": "keyword card"},
+        {"t": "10-25s", "voice": (hint and f"기사 요약 힌트: {hint}." or "제목에서 포인트를 먼저 잡아볼게요."), "onscreen": "포인트", "broll": "headline closeup"},
+        {"t": "25-40s", "voice": "사람들이 멈춰보는 지점이 있어요.", "onscreen": "반응 포인트", "broll": "comments"},
+        {"t": "40-55s", "voice": "자세한 내용은 기사 확인이 가장 안전합니다.", "onscreen": "기사 확인", "broll": "article page"},
+        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 요약. 구독!", "onscreen": "구독", "broll": "subscribe"},
     ]
-
     return {
         "topic": topic,
         "title_short": topic[:28],
@@ -349,17 +391,18 @@ def build_60s_shorts_script_template(topic: str, article_ctx: dict[str, Any]) ->
         "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"],
         "notes": "OpenAI 실패/미설정 시 템플릿으로 생성",
         "_generator": "template",
+        "_style": "template",
+        "_voice_chars": sum(len(b["voice"]) for b in beats),
     }
 
 
 # ===========================
-# OpenAI 대본 생성(2단계: facts -> script) + 길이 편집
+# OpenAI 대본 생성(2단계: facts -> script)
 # ===========================
 def _pick_style() -> str:
+    env_style = os.getenv("SHORTS_STYLE", "").strip().lower()
     styles = ["timeline", "qna", "mythfact", "3points"]
-    if SHORTS_STYLE in styles:
-        return SHORTS_STYLE
-    return random.choice(styles)
+    return env_style if env_style in styles else random.choice(styles)
 
 
 def _voice_total_chars(beats: list[dict[str, Any]]) -> int:
@@ -367,17 +410,13 @@ def _voice_total_chars(beats: list[dict[str, Any]]) -> int:
 
 
 def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
-    # openai 라이브러리 미설치 등일 때를 대비
     from openai import OpenAI
 
     client = OpenAI()
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    max_out = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
-
     style = _pick_style()
     article_ctx = inputs.get("article_ctx", {}) or {}
 
-    # ✅ 중요: strict json_schema는 object마다 additionalProperties: False 필수
+    # strict schema => object마다 additionalProperties: False 필요
     facts_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -410,7 +449,7 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
     facts_resp = client.responses.create(
-        model=model,
+        model=OPENAI_TEXT_MODEL,
         input=[
             {"role": "system", "content": sys_facts},
             {"role": "user", "content": json.dumps(user_facts_payload, ensure_ascii=False)},
@@ -468,67 +507,185 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
     script_resp = client.responses.create(
-        model=model,
+        model=OPENAI_TEXT_MODEL,
         input=[
             {"role": "system", "content": sys_script},
             {"role": "user", "content": json.dumps(user_script_payload, ensure_ascii=False)},
         ],
         text={"format": {"type": "json_schema", "name": "shorts_script", "strict": True, "schema": script_schema}},
-        max_output_tokens=max_out,
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
     )
     draft = json.loads(script_resp.output_text)
     draft["_generator"] = "openai_v2"
     draft["_style"] = style
-
-    beats = draft.get("beats") or []
-    if isinstance(beats, list) and len(beats) == 6:
-        total_chars = _voice_total_chars(beats)
-        draft["_voice_chars"] = total_chars
-
-        # 분량이 너무 짧거나 길면 1번 편집
-        if total_chars < VOICE_CHARS_MIN or total_chars > VOICE_CHARS_MAX:
-            fix_mode = "expand" if total_chars < VOICE_CHARS_MIN else "shorten"
-            sys_fix = (
-                "너는 쇼츠 대본 편집자다. "
-                "원본 6구간 구조/사실 제약은 유지하고, "
-                f"voice 전체 분량을 {'늘려' if fix_mode=='expand' else '줄여'}라. "
-                "과장/루머/비방 금지. onscreen 12자 이내 유지."
-            )
-            user_fix_payload = {
-                "fix_mode": fix_mode,
-                "target_voice_chars_min": VOICE_CHARS_MIN,
-                "target_voice_chars_max": VOICE_CHARS_MAX,
-                "draft": draft,
-                "facts_pack": facts_pack,
-            }
-
-            fix_resp = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": sys_fix},
-                    {"role": "user", "content": json.dumps(user_fix_payload, ensure_ascii=False)},
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "shorts_script_fixed",
-                        "strict": True,
-                        "schema": script_schema,
-                    }
-                },
-                max_output_tokens=max_out,
-            )
-            fixed = json.loads(fix_resp.output_text)
-            fixed["_generator"] = "openai_v2_edit"
-            fixed["_style"] = style
-            fixed["_voice_chars"] = _voice_total_chars(fixed.get("beats") or [])
-            return fixed
+    draft["_voice_chars"] = _voice_total_chars(draft.get("beats") or [])
 
     return draft
 
 
 # ===========================
-# 노드
+# (A) 이미지 수집: Pexels
+# ===========================
+def pexels_search(query: str, per_page: int = 15) -> list[dict[str, Any]]:
+    if not PEXELS_API_KEY:
+        return []
+    url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
+    headers = {"Authorization": PEXELS_API_KEY}
+    data = _http_json(url, headers=headers, timeout=30)
+    return data.get("photos", []) or []
+
+
+def build_image_queries(topic: str, beats: list[dict[str, Any]]) -> list[str]:
+    # 토픽 + broll + onscreen으로 검색어 생성
+    queries = []
+    for b in beats:
+        q = " ".join([topic, b.get("broll", ""), b.get("onscreen", "")]).strip()
+        q = _clean_text(q)[:80]
+        queries.append(q)
+    return queries
+
+
+def collect_images_from_pexels(topic: str, beats: list[dict[str, Any]]) -> dict[str, Any]:
+    queries = build_image_queries(topic, beats)
+
+    results: list[dict[str, Any]] = []
+    files: list[Path] = []
+
+    for idx, q in enumerate(queries, start=1):
+        log(f"[PEXELS] beat{idx} query={q}")
+        items = pexels_search(q, per_page=PEXELS_PER_PAGE)
+        if not items:
+            results.append({"beat": idx, "query": q, "ok": False, "reason": "no results"})
+            continue
+
+        # 후보 중 랜덤(상위 8개 안에서)
+        cand = items[: min(8, len(items))]
+        pick = random.choice(cand)
+
+        src = pick.get("src") or {}
+        dl = src.get("large2x") or src.get("large") or src.get("original")
+        if not dl:
+            results.append({"beat": idx, "query": q, "ok": False, "reason": "no download url"})
+            continue
+
+        out_path = IMG_DIR / f"beat{idx:02d}_pexels_{pick.get('id')}.jpg"
+        _http_download(dl, out_path, timeout=60)
+
+        results.append(
+            {
+                "beat": idx,
+                "query": q,
+                "ok": True,
+                "provider": "pexels",
+                "file": str(out_path),
+                "id": pick.get("id"),
+                "page_url": pick.get("url"),
+                "photographer": pick.get("photographer"),
+                "photographer_url": pick.get("photographer_url"),
+                "download_url": dl,
+            }
+        )
+        files.append(out_path)
+
+    _write_json(OUT_DIR / "images_manifest.json", {"provider": "pexels", "topic": topic, "images": results})
+    return {"provider": "pexels", "images": results, "files": [str(p) for p in files]}
+
+
+# ===========================
+# (B) 음성 생성: OpenAI TTS (audio/speech)
+# ===========================
+def make_voice_openai(narration: str, out_mp3: Path) -> None:
+    # Audio API: /v1/audio/speech :contentReference[oaicite:4]{index=4}
+    # 가이드 예시: client.audio.speech.with_streaming_response.create :contentReference[oaicite:5]{index=5}
+    from openai import OpenAI
+
+    narration = narration.strip()
+    if len(narration) > 3900:
+        narration = narration[:3900]
+
+    client = OpenAI()
+    out_mp3.parent.mkdir(parents=True, exist_ok=True)
+
+    with client.audio.speech.with_streaming_response.create(
+        model=OPENAI_TTS_MODEL,
+        voice=OPENAI_TTS_VOICE,
+        input=narration,
+        instructions=OPENAI_TTS_INSTRUCTIONS,
+    ) as response:
+        response.stream_to_file(out_mp3)
+
+
+# ===========================
+# (C) 자막 생성: SRT
+# ===========================
+def make_captions_srt(beats: list[dict[str, Any]], out_srt: Path) -> None:
+    lines = []
+    for i, b in enumerate(beats, start=1):
+        start, end = parse_time_range(b["t"])
+        text = (b.get("voice") or "").strip()
+        text = text.replace("\n", " ")
+        lines.append(str(i))
+        lines.append(f"{srt_ts(start)} --> {srt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+    _write_text(out_srt, "\n".join(lines))
+
+
+# ===========================
+# (D) 비디오 합성: ffmpeg
+# ===========================
+def build_video_ffmpeg(image_paths: list[str], beats: list[dict[str, Any]], audio_mp3: Path, captions_srt: Path, out_mp4: Path) -> None:
+    # 각 beat 시간대로 이미지 duration을 정함
+    durations = []
+    for b in beats:
+        s, e = parse_time_range(b["t"])
+        durations.append(max(0.5, e - s))
+
+    # 이미지가 부족하면 마지막 이미지로 채움
+    if not image_paths:
+        raise RuntimeError("No images to build video.")
+    while len(image_paths) < len(durations):
+        image_paths.append(image_paths[-1])
+
+    # ffmpeg 입력 구성
+    cmd = ["ffmpeg", "-y"]
+    for img, d in zip(image_paths[: len(durations)], durations):
+        cmd += ["-loop", "1", "-t", f"{d}", "-i", img]
+
+    cmd += ["-i", str(audio_mp3)]
+
+    # filter: 각 이미지 -> 1080x1920 crop/scale, fps, concat, subtitles
+    filter_parts = []
+    for i in range(len(durations)):
+        filter_parts.append(
+            f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={FPS},format=yuv420p,setsar=1[v{i}]"
+        )
+    v_in = "".join([f"[v{i}]" for i in range(len(durations))])
+    filter_parts.append(f"{v_in}concat=n={len(durations)}:v=1:a=0[vcat]")
+    # subtitles (libass). 한국어 폰트는 workflow에서 fonts-noto-cjk 설치로 해결.
+    filter_parts.append(f"[vcat]subtitles={captions_srt.as_posix()}[vout]")
+    filter_complex = ";".join(filter_parts)
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", f"{len(durations)}:a",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(out_mp4),
+    ]
+
+    log("[FFMPEG] " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+# ===========================
+# 노드들
 # ===========================
 def node_load_inputs(ctx: dict[str, Any]):
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
@@ -543,101 +700,101 @@ def node_load_inputs(ctx: dict[str, Any]):
 
 def node_make_script(ctx: dict[str, Any]):
     inp = ctx["inputs"]
-
-    # OpenAI 키가 있으면 OpenAI로 생성, 실패하면 템플릿
     if os.getenv("OPENAI_API_KEY"):
         try:
             ctx["shorts"] = build_60s_shorts_script_openai(inp)
             return
         except Exception as e:
-            (OUT_DIR / "openai_error.txt").write_text(str(e), encoding="utf-8")
+            _write_text(OUT_DIR / "openai_error.txt", str(e))
 
     ctx["shorts"] = build_60s_shorts_script_template(inp["topic"], inp.get("article_ctx", {}))
 
 
-def node_save_files(ctx: dict[str, Any]):
+def node_collect_images(ctx: dict[str, Any]):
+    topic = ctx["inputs"]["topic"]
+    beats = ctx["shorts"]["beats"]
+
+    if not PEXELS_API_KEY:
+        # 키 없으면 영상 제작은 되더라도 의미가 없으니 명확히 실패 처리
+        raise RuntimeError("PEXELS_API_KEY가 없습니다. GitHub Secrets에 PEXELS_API_KEY를 추가하세요.")
+
+    ctx["images"] = collect_images_from_pexels(topic, beats)
+
+
+def node_make_voice(ctx: dict[str, Any]):
+    beats = ctx["shorts"]["beats"]
+    narration = "\n".join([b["voice"] for b in beats])
+
+    kst = now_kst()
+    stamp = kst.strftime("%Y%m%d_%H%M")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    audio_path = OUT_DIR / f"voice_{stamp}_{run_id}.mp3"
+
+    make_voice_openai(narration, audio_path)
+    ctx["audio"] = {"path": str(audio_path), "text_len": len(narration)}
+
+
+def node_make_video(ctx: dict[str, Any]):
+    beats = ctx["shorts"]["beats"]
+
     kst = now_kst()
     stamp = kst.strftime("%Y%m%d_%H%M")
     run_id = os.getenv("GITHUB_RUN_ID", "local")
 
-    script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
-    meta_path = OUT_DIR / f"shorts_{stamp}_{run_id}.json"
+    captions_srt = OUT_DIR / f"captions_{stamp}_{run_id}.srt"
+    make_captions_srt(beats, captions_srt)
 
-    src = ctx["inputs"]
-    shorts = ctx["shorts"]
-    a = src.get("article_ctx", {}) or {}
+    audio_mp3 = Path(ctx["audio"]["path"])
+    image_files = ctx["images"]["files"]
 
-    txt: list[str] = []
-    txt.append(f"DATE(KST): {kst.isoformat()}")
-    txt.append(f"RUN_ID: {run_id}")
-    txt.append(f"GENERATOR: {shorts.get('_generator')}")
-    txt.append(f"STYLE: {shorts.get('_style', '')}")
-    txt.append(f"VOICE_CHARS: {shorts.get('_voice_chars', '')}")
-    txt.append(f"TOPIC: {shorts.get('topic')}")
-    txt.append(f"SOURCE_URL: {src['source_url']}")
-    txt.append(f"RANKING_PAGE: {src['ranking_page']}")
-    txt.append(f"ARTICLE_OG_TITLE: {a.get('og_title','')}")
-    txt.append(f"ARTICLE_OG_DESC: {a.get('og_description','')}")
-    txt.append(f"ARTICLE_PUBLISHED: {a.get('published_time','')}")
-    txt.append("")
-    txt.append("=== SCRIPT ===")
+    out_mp4 = OUT_DIR / f"shorts_{stamp}_{run_id}.mp4"
+    build_video_ffmpeg(image_files, beats, audio_mp3, captions_srt, out_mp4)
 
-    beats = shorts.get("beats") or []
-    if isinstance(beats, list) and len(beats) == 6:
-        for b in beats:
-            txt.append(f'[{b["t"]}] {b["voice"]}')
-            txt.append(f'  - ONSCREEN: {b["onscreen"]}')
-            txt.append(f'  - BROLL: {b["broll"]}')
-    else:
-        txt.append(shorts.get("notes", "") or "")
+    ctx["video"] = {"path": str(out_mp4), "captions": str(captions_srt)}
 
-    txt.append("")
-    txt.append("TITLE_SHORT: " + (shorts.get("title_short") or ""))
-    txt.append("DESCRIPTION: " + (shorts.get("description") or ""))
-    txt.append("NOTES: " + (shorts.get("notes") or ""))
-    txt.append("")
-    txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
 
-    script_path.write_text("\n".join(txt), encoding="utf-8")
+def node_save_meta(ctx: dict[str, Any]):
+    kst = now_kst()
+    stamp = kst.strftime("%Y%m%d_%H%M")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
 
-    meta = {
-        "date_kst": kst.isoformat(),
-        "run_id": run_id,
-        "inputs": src,
-        "shorts": shorts,
-        "files": {"script": str(script_path), "meta": str(meta_path)},
-    }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    ctx["outputs"] = {"script_path": str(script_path), "meta_path": str(meta_path)}
+    meta_path = OUT_DIR / f"meta_{stamp}_{run_id}.json"
+    _write_json(meta_path, {"date_kst": kst.isoformat(), "run_id": run_id, **ctx})
+    ctx["meta"] = {"path": str(meta_path)}
 
 
 def node_print(ctx: dict[str, Any]):
     log("TOPIC: " + ctx["inputs"]["topic"])
     log("SOURCE_URL: " + ctx["inputs"]["source_url"])
-    log("GENERATOR: " + str(ctx["shorts"].get("_generator")))
-    log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
-    log("META FILE: " + ctx["outputs"]["meta_path"])
+    log("SCRIPT_GENERATOR: " + str(ctx["shorts"].get("_generator")))
+    log("AUDIO: " + str(ctx.get("audio", {}).get("path")))
+    log("VIDEO: " + str(ctx.get("video", {}).get("path")))
+    log("META: " + str(ctx.get("meta", {}).get("path")))
 
 
 # ===========================
-# 연결/실행
+# 실행 연결
 # ===========================
 flow = Flow()
 flow.add(Node("LOAD_INPUTS", node_load_inputs))
 flow.add(Node("MAKE_SCRIPT", node_make_script))
-flow.add(Node("SAVE_FILES", node_save_files))
+flow.add(Node("COLLECT_IMAGES", node_collect_images))
+flow.add(Node("MAKE_VOICE", node_make_voice))
+flow.add(Node("MAKE_VIDEO", node_make_video))
+flow.add(Node("SAVE_META", node_save_meta))
 flow.add(Node("PRINT", node_print))
 
 flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
-flow.connect("MAKE_SCRIPT", "SAVE_FILES")
-flow.connect("SAVE_FILES", "PRINT")
+flow.connect("MAKE_SCRIPT", "COLLECT_IMAGES")
+flow.connect("COLLECT_IMAGES", "MAKE_VOICE")
+flow.connect("MAKE_VOICE", "MAKE_VIDEO")
+flow.connect("MAKE_VIDEO", "SAVE_META")
+flow.connect("SAVE_META", "PRINT")
 
 if __name__ == "__main__":
     try:
         ctx = flow.run("LOAD_INPUTS")
-        log("\n[끝] inputs = " + json.dumps(ctx.get("inputs"), ensure_ascii=False))
+        log("\n[끝] OK")
     except Exception:
-        (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
-
