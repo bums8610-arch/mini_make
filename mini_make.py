@@ -27,17 +27,17 @@ IMG_DIR.mkdir(parents=True, exist_ok=True)
 
 RANKING_URL = "https://m.entertain.naver.com/ranking"
 
-# 대본 분량(문자수) 보정 범위
+# 대본 분량(문자수) 보정 범위(현재는 편집 단계 미사용, 추후 확장 가능)
 VOICE_CHARS_MIN = int(os.getenv("VOICE_CHARS_MIN", "360"))
 VOICE_CHARS_MAX = int(os.getenv("VOICE_CHARS_MAX", "620"))
 
-# OpenAI 모델(텍스트 대본)
+# OpenAI 텍스트 모델
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 
 # OpenAI TTS
-OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # docs: audio/speech :contentReference[oaicite:2]{index=2}
-OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")           # 추천 voice 예시 :contentReference[oaicite:3]{index=3}
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
 OPENAI_TTS_INSTRUCTIONS = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
     "한국어 뉴스 쇼츠 톤. 또박또박, 과장 없이, 빠르지 않게."
@@ -46,7 +46,7 @@ OPENAI_TTS_INSTRUCTIONS = os.getenv(
 # 이미지(Pexels)
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 IMAGES_PER_BEAT = int(os.getenv("IMAGES_PER_BEAT", "1"))  # 기본 1장/구간
-PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "15"))
+PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "20"))
 
 # 비디오(쇼츠) 해상도
 W, H = 1080, 1920
@@ -94,7 +94,6 @@ def _http_download(url: str, out_path: Path, headers: dict[str, str] | None = No
 
 
 def parse_time_range(t: str) -> tuple[float, float]:
-    # "10-25s" -> (10, 25)
     m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*s\s*$", t)
     if not m:
         raise ValueError(f"Bad time range: {t}")
@@ -102,7 +101,6 @@ def parse_time_range(t: str) -> tuple[float, float]:
 
 
 def srt_ts(seconds: float) -> str:
-    # 12.34 -> "00:00:12,340"
     if seconds < 0:
         seconds = 0
     ms = int(round(seconds * 1000))
@@ -376,12 +374,12 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
 def build_60s_shorts_script_template(topic: str, article_ctx: dict[str, Any]) -> dict[str, Any]:
     hint = (article_ctx.get("og_description") or "").strip()[:60]
     beats = [
-        {"t": "0-2s",   "voice": f"오늘 연예 랭킹, {topic}.", "onscreen": "오늘의 랭킹", "broll": "ranking screen"},
-        {"t": "2-10s",  "voice": "핵심만 1분으로 정리합니다.", "onscreen": "1분 요약", "broll": "keyword card"},
-        {"t": "10-25s", "voice": (hint and f"기사 요약 힌트: {hint}." or "제목에서 포인트를 먼저 잡아볼게요."), "onscreen": "포인트", "broll": "headline closeup"},
-        {"t": "25-40s", "voice": "사람들이 멈춰보는 지점이 있어요.", "onscreen": "반응 포인트", "broll": "comments"},
-        {"t": "40-55s", "voice": "자세한 내용은 기사 확인이 가장 안전합니다.", "onscreen": "기사 확인", "broll": "article page"},
-        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 요약. 구독!", "onscreen": "구독", "broll": "subscribe"},
+        {"t": "0-2s",   "voice": f"오늘 연예 랭킹, {topic}.", "onscreen": "오늘의 랭킹", "broll": "entertainment news ranking"},
+        {"t": "2-10s",  "voice": "핵심만 1분으로 정리합니다.", "onscreen": "1분 요약", "broll": "news keywords"},
+        {"t": "10-25s", "voice": (hint and f"기사 요약 힌트: {hint}." or "제목에서 포인트를 먼저 잡아볼게요."), "onscreen": "포인트", "broll": "headline concept"},
+        {"t": "25-40s", "voice": "사람들이 멈춰보는 지점이 있어요.", "onscreen": "반응 포인트", "broll": "social reaction"},
+        {"t": "40-55s", "voice": "자세한 내용은 기사 확인이 가장 안전합니다.", "onscreen": "기사 확인", "broll": "reading news on phone"},
+        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 요약. 구독!", "onscreen": "구독", "broll": "subscribe button"},
     ]
     return {
         "topic": topic,
@@ -416,7 +414,6 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     style = _pick_style()
     article_ctx = inputs.get("article_ctx", {}) or {}
 
-    # strict schema => object마다 additionalProperties: False 필요
     facts_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -494,7 +491,7 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         "facts 밖의 내용은 단정 금지(필요 시 '기사 요약 기준'으로 표현). "
         "과장/루머/비방 금지. "
         "정확히 6구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s)으로 구성. "
-        "onscreen은 12자 이내. voice는 말로 읽기 좋게. "
+        "onscreen은 12자 이내. voice는 말로 읽기 좋게."
         f"스타일은 {style}."
     )
 
@@ -519,14 +516,108 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     draft["_generator"] = "openai_v2"
     draft["_style"] = style
     draft["_voice_chars"] = _voice_total_chars(draft.get("beats") or [])
-
     return draft
 
 
 # ===========================
-# (A) 이미지 수집: Pexels
+# (1번) OpenAI로 "스톡사진에 잘 맞는" 이미지 검색어 6개 만들기
 # ===========================
-def pexels_search(query: str, per_page: int = 15) -> list[dict[str, Any]]:
+def generate_image_queries_openai(inputs: dict[str, Any], shorts: dict[str, Any]) -> dict[str, Any]:
+    """
+    beats(6개)마다:
+      - search_query: Pexels에 바로 넣을 영어 검색어(짧고 구체적)
+      - fallback_query: 결과 없을 때 대체 검색어(더 일반적)
+      - avoid: 피해야 할 단어(텍스트/로고/스크린샷 등)
+    """
+    from openai import OpenAI
+
+    client = OpenAI()
+
+    beats = shorts.get("beats") or []
+    if not (isinstance(beats, list) and len(beats) == 6):
+        return {"ok": False, "reason": "beats not found"}
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "topic": {"type": "string"},
+            "items": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "beat": {"type": "integer", "minimum": 1, "maximum": 6},
+                        "search_query": {"type": "string"},
+                        "fallback_query": {"type": "string"},
+                        "keywords": {"type": "array", "minItems": 3, "maxItems": 10, "items": {"type": "string"}},
+                        "avoid": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "string"}},
+                    },
+                    "required": ["beat", "search_query", "fallback_query", "keywords", "avoid"],
+                },
+            },
+            "notes": {"type": "string"},
+        },
+        "required": ["topic", "items", "notes"],
+    }
+
+    article_ctx = inputs.get("article_ctx", {}) or {}
+
+    sys = (
+        "너는 쇼츠 영상 편집자의 '스톡 이미지 검색어' 전문가다.\n"
+        "목표: Pexels 같은 스톡 사이트에서 결과가 잘 뜨는 영어 검색어를 6개 만든다.\n"
+        "규칙:\n"
+        "- 인물 실명/특정 연예인 이름은 되도록 넣지 말고, 일반화(celebrity, pop star, actor 등)로 표현.\n"
+        "- 'screenshot, ranking, naver' 같은 화면 캡처 느낌 단어는 피한다.\n"
+        "- search_query는 4~8 단어로, 장면(장소+인물+행동+감정)을 포함.\n"
+        "- fallback_query는 더 일반적인 2~5 단어.\n"
+        "- avoid에는 text, logo, watermark, screenshot 같은 피해야 할 단어를 넣는다.\n"
+        "- beats의 broll/onscreen/voice에서 '장면'을 상상해 만든다.\n"
+    )
+
+    user_payload = {
+        "topic": inputs.get("topic", ""),
+        "og_title": article_ctx.get("og_title", ""),
+        "og_description": article_ctx.get("og_description", ""),
+        "beats": [
+            {
+                "beat": i + 1,
+                "t": b.get("t"),
+                "voice": (b.get("voice") or "")[:220],
+                "onscreen": b.get("onscreen"),
+                "broll": b.get("broll"),
+            }
+            for i, b in enumerate(beats)
+        ],
+    }
+
+    resp = client.responses.create(
+        model=OPENAI_TEXT_MODEL,
+        input=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        text={"format": {"type": "json_schema", "name": "image_query_pack", "strict": True, "schema": schema}},
+        max_output_tokens=700,
+    )
+
+    pack = json.loads(resp.output_text)
+
+    # 최소 안전 정리
+    for it in pack.get("items", []):
+        it["search_query"] = _clean_text(it.get("search_query", ""))[:90]
+        it["fallback_query"] = _clean_text(it.get("fallback_query", ""))[:60]
+
+    return {"ok": True, "pack": pack}
+
+
+# ===========================
+# 이미지 수집: Pexels
+# ===========================
+def pexels_search(query: str, per_page: int = 20) -> list[dict[str, Any]]:
     if not PEXELS_API_KEY:
         return []
     url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
@@ -535,8 +626,97 @@ def pexels_search(query: str, per_page: int = 15) -> list[dict[str, Any]]:
     return data.get("photos", []) or []
 
 
-def build_image_queries(topic: str, beats: list[dict[str, Any]]) -> list[str]:
-    # 토픽 + broll + onscreen으로 검색어 생성
+def score_pexels_photo(p: dict[str, Any]) -> float:
+    """
+    세로(9:16) 비율 + 해상도 높을수록 점수↑
+    """
+    w = float(p.get("width") or 0)
+    h = float(p.get("height") or 0)
+    if w <= 0 or h <= 0:
+        return 0.0
+    ratio = w / h  # portrait면 0.5625(=9/16) 근처가 좋음
+    target = 9.0 / 16.0
+    ratio_score = max(0.0, 1.0 - abs(ratio - target) * 2.0)  # 대충 근접도
+    res_score = (w * h) / (3000 * 4000)  # 12MP를 1.0 근처로
+    return ratio_score * 0.7 + min(1.5, res_score) * 0.3
+
+
+def collect_images_from_pexels_with_openai(topic: str, beats: list[dict[str, Any]], query_pack: dict[str, Any]) -> dict[str, Any]:
+    """
+    OpenAI가 만든 query_pack.items(6개)를 따라 이미지 수집.
+    - search_query → 없으면 fallback_query → 그래도 없으면 topic 기반 일반 쿼리
+    - 각 beat마다 상위 점수 사진을 선택(랜덤 아님, 품질 우선)
+    """
+    items = (query_pack.get("items") or [])
+    if not (isinstance(items, list) and len(items) == 6):
+        raise RuntimeError("image_query_pack.items가 올바르지 않습니다.")
+
+    results: list[dict[str, Any]] = []
+    files: list[Path] = []
+
+    for idx in range(1, 7):
+        it = items[idx - 1]
+        q1 = it.get("search_query", "")
+        q2 = it.get("fallback_query", "")
+        avoid = it.get("avoid", []) or []
+
+        # Pexels는 negative filter가 없어서, avoid는 참고용으로만 기록
+        log(f"[PEXELS] beat{idx} q1={q1} / q2={q2}")
+
+        photos = pexels_search(q1, per_page=PEXELS_PER_PAGE) if q1 else []
+        used_query = q1
+
+        if not photos and q2:
+            photos = pexels_search(q2, per_page=PEXELS_PER_PAGE)
+            used_query = q2
+
+        if not photos:
+            fallback = _clean_text(f"{topic} portrait")[:80]
+            photos = pexels_search(fallback, per_page=PEXELS_PER_PAGE)
+            used_query = fallback
+
+        if not photos:
+            results.append({"beat": idx, "query": used_query, "ok": False, "reason": "no results"})
+            continue
+
+        # 품질 우선: 점수 높은 순으로 정렬 후 상위 3개 중 랜덤(완전 고정 방지)
+        ranked = sorted(photos, key=score_pexels_photo, reverse=True)
+        pick = random.choice(ranked[: min(3, len(ranked))])
+
+        src = pick.get("src") or {}
+        dl = src.get("large2x") or src.get("large") or src.get("original")
+        if not dl:
+            results.append({"beat": idx, "query": used_query, "ok": False, "reason": "no download url"})
+            continue
+
+        out_path = IMG_DIR / f"beat{idx:02d}_pexels_{pick.get('id')}.jpg"
+        _http_download(dl, out_path, timeout=60)
+
+        results.append(
+            {
+                "beat": idx,
+                "query": used_query,
+                "avoid": avoid,
+                "ok": True,
+                "provider": "pexels",
+                "file": str(out_path),
+                "id": pick.get("id"),
+                "page_url": pick.get("url"),
+                "photographer": pick.get("photographer"),
+                "photographer_url": pick.get("photographer_url"),
+                "download_url": dl,
+                "w": pick.get("width"),
+                "h": pick.get("height"),
+                "score": score_pexels_photo(pick),
+            }
+        )
+        files.append(out_path)
+
+    _write_json(OUT_DIR / "images_manifest.json", {"provider": "pexels", "topic": topic, "images": results})
+    return {"provider": "pexels", "images": results, "files": [str(p) for p in files]}
+
+
+def build_image_queries_fallback(topic: str, beats: list[dict[str, Any]]) -> list[str]:
     queries = []
     for b in beats:
         q = " ".join([topic, b.get("broll", ""), b.get("onscreen", "")]).strip()
@@ -545,22 +725,20 @@ def build_image_queries(topic: str, beats: list[dict[str, Any]]) -> list[str]:
     return queries
 
 
-def collect_images_from_pexels(topic: str, beats: list[dict[str, Any]]) -> dict[str, Any]:
-    queries = build_image_queries(topic, beats)
-
+def collect_images_from_pexels_basic(topic: str, beats: list[dict[str, Any]]) -> dict[str, Any]:
+    queries = build_image_queries_fallback(topic, beats)
     results: list[dict[str, Any]] = []
     files: list[Path] = []
 
     for idx, q in enumerate(queries, start=1):
-        log(f"[PEXELS] beat{idx} query={q}")
-        items = pexels_search(q, per_page=PEXELS_PER_PAGE)
-        if not items:
+        log(f"[PEXELS-basic] beat{idx} query={q}")
+        photos = pexels_search(q, per_page=PEXELS_PER_PAGE)
+        if not photos:
             results.append({"beat": idx, "query": q, "ok": False, "reason": "no results"})
             continue
 
-        # 후보 중 랜덤(상위 8개 안에서)
-        cand = items[: min(8, len(items))]
-        pick = random.choice(cand)
+        ranked = sorted(photos, key=score_pexels_photo, reverse=True)
+        pick = random.choice(ranked[: min(3, len(ranked))])
 
         src = pick.get("src") or {}
         dl = src.get("large2x") or src.get("large") or src.get("original")
@@ -570,7 +748,6 @@ def collect_images_from_pexels(topic: str, beats: list[dict[str, Any]]) -> dict[
 
         out_path = IMG_DIR / f"beat{idx:02d}_pexels_{pick.get('id')}.jpg"
         _http_download(dl, out_path, timeout=60)
-
         results.append(
             {
                 "beat": idx,
@@ -583,6 +760,9 @@ def collect_images_from_pexels(topic: str, beats: list[dict[str, Any]]) -> dict[
                 "photographer": pick.get("photographer"),
                 "photographer_url": pick.get("photographer_url"),
                 "download_url": dl,
+                "w": pick.get("width"),
+                "h": pick.get("height"),
+                "score": score_pexels_photo(pick),
             }
         )
         files.append(out_path)
@@ -592,11 +772,9 @@ def collect_images_from_pexels(topic: str, beats: list[dict[str, Any]]) -> dict[
 
 
 # ===========================
-# (B) 음성 생성: OpenAI TTS (audio/speech)
+# 음성 생성: OpenAI TTS
 # ===========================
 def make_voice_openai(narration: str, out_mp3: Path) -> None:
-    # Audio API: /v1/audio/speech :contentReference[oaicite:4]{index=4}
-    # 가이드 예시: client.audio.speech.with_streaming_response.create :contentReference[oaicite:5]{index=5}
     from openai import OpenAI
 
     narration = narration.strip()
@@ -616,14 +794,13 @@ def make_voice_openai(narration: str, out_mp3: Path) -> None:
 
 
 # ===========================
-# (C) 자막 생성: SRT
+# 자막(SRT)
 # ===========================
 def make_captions_srt(beats: list[dict[str, Any]], out_srt: Path) -> None:
     lines = []
     for i, b in enumerate(beats, start=1):
         start, end = parse_time_range(b["t"])
-        text = (b.get("voice") or "").strip()
-        text = text.replace("\n", " ")
+        text = (b.get("voice") or "").strip().replace("\n", " ")
         lines.append(str(i))
         lines.append(f"{srt_ts(start)} --> {srt_ts(end)}")
         lines.append(text)
@@ -632,29 +809,26 @@ def make_captions_srt(beats: list[dict[str, Any]], out_srt: Path) -> None:
 
 
 # ===========================
-# (D) 비디오 합성: ffmpeg
+# 비디오 합성: ffmpeg
 # ===========================
 def build_video_ffmpeg(image_paths: list[str], beats: list[dict[str, Any]], audio_mp3: Path, captions_srt: Path, out_mp4: Path) -> None:
-    # 각 beat 시간대로 이미지 duration을 정함
     durations = []
     for b in beats:
         s, e = parse_time_range(b["t"])
         durations.append(max(0.5, e - s))
 
-    # 이미지가 부족하면 마지막 이미지로 채움
     if not image_paths:
         raise RuntimeError("No images to build video.")
+
     while len(image_paths) < len(durations):
         image_paths.append(image_paths[-1])
 
-    # ffmpeg 입력 구성
     cmd = ["ffmpeg", "-y"]
     for img, d in zip(image_paths[: len(durations)], durations):
         cmd += ["-loop", "1", "-t", f"{d}", "-i", img]
 
     cmd += ["-i", str(audio_mp3)]
 
-    # filter: 각 이미지 -> 1080x1920 crop/scale, fps, concat, subtitles
     filter_parts = []
     for i in range(len(durations)):
         filter_parts.append(
@@ -663,7 +837,6 @@ def build_video_ffmpeg(image_paths: list[str], beats: list[dict[str, Any]], audi
         )
     v_in = "".join([f"[v{i}]" for i in range(len(durations))])
     filter_parts.append(f"{v_in}concat=n={len(durations)}:v=1:a=0[vcat]")
-    # subtitles (libass). 한국어 폰트는 workflow에서 fonts-noto-cjk 설치로 해결.
     filter_parts.append(f"[vcat]subtitles={captions_srt.as_posix()}[vout]")
     filter_complex = ";".join(filter_parts)
 
@@ -715,10 +888,23 @@ def node_collect_images(ctx: dict[str, Any]):
     beats = ctx["shorts"]["beats"]
 
     if not PEXELS_API_KEY:
-        # 키 없으면 영상 제작은 되더라도 의미가 없으니 명확히 실패 처리
         raise RuntimeError("PEXELS_API_KEY가 없습니다. GitHub Secrets에 PEXELS_API_KEY를 추가하세요.")
 
-    ctx["images"] = collect_images_from_pexels(topic, beats)
+    # (1번) OpenAI로 검색어 생성 → Pexels 검색 품질 상승
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            qres = generate_image_queries_openai(ctx["inputs"], ctx["shorts"])
+            if qres.get("ok"):
+                pack = qres["pack"]
+                _write_json(OUT_DIR / "image_queries.json", pack)
+                ctx["image_queries"] = pack
+                ctx["images"] = collect_images_from_pexels_with_openai(topic, beats, pack)
+                return
+        except Exception as e:
+            _write_text(OUT_DIR / "image_query_error.txt", str(e))
+
+    # OpenAI 실패 시 basic
+    ctx["images"] = collect_images_from_pexels_basic(topic, beats)
 
 
 def node_make_voice(ctx: dict[str, Any]):
@@ -767,6 +953,8 @@ def node_print(ctx: dict[str, Any]):
     log("TOPIC: " + ctx["inputs"]["topic"])
     log("SOURCE_URL: " + ctx["inputs"]["source_url"])
     log("SCRIPT_GENERATOR: " + str(ctx["shorts"].get("_generator")))
+    if "image_queries" in ctx:
+        log("IMAGE_QUERIES: outputs/image_queries.json")
     log("AUDIO: " + str(ctx.get("audio", {}).get("path")))
     log("VIDEO: " + str(ctx.get("video", {}).get("path")))
     log("META: " + str(ctx.get("meta", {}).get("path")))
@@ -798,3 +986,4 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
+
