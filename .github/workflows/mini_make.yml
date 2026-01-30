@@ -22,6 +22,7 @@ jobs:
       OPENAI_MODEL: "gpt-4.1-mini"
       OPENAI_MAX_OUTPUT_TOKENS: "900"
       USE_OPENAI: "1"
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
@@ -38,20 +39,9 @@ jobs:
         run: |
           set -euo pipefail
           python -V
-          pip -V
           pip install --upgrade pip
           pip install openai playwright
           python -m playwright install --with-deps chromium
-
-      - name: Check OpenAI key exists (safe)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${OPENAI_API_KEY:-}" ]; then
-            echo "OPENAI_API_KEY is set"
-          else
-            echo "OPENAI_API_KEY is NOT set -> template fallback will be used"
-          fi
 
       - name: Run (capture stdout+stderr)
         shell: bash
@@ -102,5 +92,5 @@ jobs:
           fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
-            -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
+            -d "{\"content\":\"✅ mini_make 성공! (이미지 6장 생성) 로그: $RUN_URL\"}" \
             "$DISCORD_WEBHOOK"
