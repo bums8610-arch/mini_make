@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
-from urllib.parse import quote_plus
+from urllib.error import HTTPError, URLError
+
 
 
 # ===========================
@@ -58,16 +59,19 @@ def _write_json(path: Path, obj: Any) -> None:
 
 def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
     req = Request(url, headers=headers or {})
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-    return json.loads(raw.decode("utf-8"))
-
-
-def _download(url: str, out_path: Path, headers: dict[str, str] | None = None, timeout: int = 60) -> None:
-    req = Request(url, headers=headers or {})
-    with urlopen(req, timeout=timeout) as resp:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(resp.read())
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8"))
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:2000]}
+    except URLError as e:
+        return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
 
 
 # ===========================
@@ -419,26 +423,36 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
 # ===========================
 # 이미지 수집(Pexels)
 # ===========================
+PEXELS_LAST_ERROR: dict[str, Any] | None = None
+
 def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
+    global PEXELS_LAST_ERROR
+    PEXELS_LAST_ERROR = None
+
     if not PEXELS_API_KEY:
+        PEXELS_LAST_ERROR = {"_error": True, "_status": 0, "_body": "missing_api_key"}
         return []
-    url = f"https://api.pexels.com/v1/search?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
-    headers = {"Authorization": PEXELS_API_KEY}
+
+    url = (
+        "https://api.pexels.com/v1/search"
+        f"?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
+    )
+    headers = {
+        "Authorization": PEXELS_API_KEY,   # Pexels 문서 방식 :contentReference[oaicite:1]{index=1}
+        "User-Agent": UA,
+        "Accept": "application/json",
+    }
     data = _http_json(url, headers=headers, timeout=30)
-    return data.get("photos", []) or []
 
+    if isinstance(data, dict) and data.get("_error"):
+        PEXELS_LAST_ERROR = data
+        # 응답 원문을 저장(Artifacts로 확인 가능)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUT_DIR / "pexels_api_error.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return []
 
-def score_photo(p: dict[str, Any]) -> float:
-    """세로 비율(9:16 근처) + 해상도 기준 점수"""
-    w = float(p.get("width") or 0)
-    h = float(p.get("height") or 0)
-    if w <= 0 or h <= 0:
-        return 0.0
-    ratio = w / h
-    target = 9.0 / 16.0
-    ratio_score = max(0.0, 1.0 - abs(ratio - target) * 2.0)
-    res_score = min(1.0, (w * h) / (3000 * 4000))
-    return ratio_score * 0.7 + res_score * 0.3
+    photos = (data or {}).get("photos", []) if isinstance(data, dict) else []
+    return photos or []
 
 
 def build_image_queries_fallback(beats: list[dict[str, Any]]) -> list[str]:
@@ -622,7 +636,13 @@ def node_make_script(ctx: dict[str, Any]):
 
 
 def node_collect_images(ctx: dict[str, Any]):
-    ctx["images"] = collect_images_from_pexels(ctx)
+    try:
+        ctx["images"] = collect_images_from_pexels(ctx)
+    except Exception:
+        # 이미지 수집 실패해도 전체 런은 계속 진행(대본/로그는 남김)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUT_DIR / "images_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        ctx["images"] = {"provider": "pexels", "ok": False, "error": "collect_images_failed"}
     return "SAVE_FILES"
 
 
@@ -709,3 +729,4 @@ if __name__ == "__main__":
     except Exception:
         (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         raise
+
