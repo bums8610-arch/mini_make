@@ -14,11 +14,11 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 
-
+from playwright.sync_api import sync_playwright
 
 
 # ===========================
-# 공통 유틸
+# 설정
 # ===========================
 OUT_DIR = Path("outputs")
 IMG_DIR = OUT_DIR / "images"
@@ -32,7 +32,11 @@ UA = (
 )
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
-PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "25"))  # 검색 결과 개수
+PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "25"))
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
+USE_OPENAI = os.getenv("USE_OPENAI", "1") == "1"
 
 
 def log(msg: str) -> None:
@@ -43,7 +47,7 @@ def now_kst() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
 
 
-def _clean_text(s: str) -> str:
+def _clean_text(s: Any) -> str:
     if not isinstance(s, str):
         return ""
     return " ".join(s.replace("\u00a0", " ").split()).strip()
@@ -74,6 +78,48 @@ def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 3
         return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:2000]}
     except URLError as e:
         return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
+
+
+def score_photo(photo: dict[str, Any]) -> float:
+    """세로(9:16)에 가까울수록 + 해상도 높을수록 점수↑"""
+    try:
+        w = float(photo.get("width") or 0)
+        h = float(photo.get("height") or 0)
+    except Exception:
+        return 0.0
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    # portrait면 w/h ≈ 9/16(0.5625)이 이상적
+    ratio = w / h
+    target = 9.0 / 16.0
+    ratio_score = max(0.0, 1.0 - abs(ratio - target) * 2.0)
+
+    # 12MP(3000*4000)를 1.0 근처로
+    res_score = min(1.5, (w * h) / (3000 * 4000))
+    return ratio_score * 0.7 + res_score * 0.3
+
+
+def _download(url: str, out_path: Path, timeout: int = 60) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "User-Agent": UA,
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+    }
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        out_path.write_bytes(data)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(f"download_failed status={getattr(e,'code',0)} url={url} body={body[:200]}") from e
+    except URLError as e:
+        raise RuntimeError(f"download_failed url={url} err={e}") from e
 
 
 # ===========================
@@ -107,11 +153,8 @@ class Flow:
 
 
 # ===========================
-# 네이버 랭킹: 랜덤 기사 선택(Playwright)
+# 네이버 랭킹에서 기사 랜덤 선택
 # ===========================
-from playwright.sync_api import sync_playwright
-
-
 def _walk_json(obj):
     if isinstance(obj, dict):
         yield obj
@@ -197,6 +240,7 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
             page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
+            # 스크롤로 더 로딩 유도
             for _ in range(3):
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1200)
@@ -223,6 +267,7 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                 }"""
             ) or []
 
+            # __NEXT_DATA__ 파싱(파이썬 json.loads만 사용)
             next_data_text = page.evaluate(
                 """() => {
                     const el = document.querySelector('#__NEXT_DATA__');
@@ -230,19 +275,14 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                 }"""
             )
             next_items: list[dict[str, str]] = []
-            if isinstance(next_data_text, str) and len(next_data_text) > 50:
-                try:
-                    next_json = JSON.parse(next_data_text)  # intentionally wrong? no, below is python json
-                except Exception:
-                    next_items = []
-            # 올바른 파싱(파이썬 json)
-            if isinstance(next_data_text, str) and len(next_data_text) > 50:
+            if next_data_text and isinstance(next_data_text, str) and len(next_data_text) > 50:
                 try:
                     next_json = json.loads(next_data_text)
                     next_items = _extract_items_from_json(next_json)
                 except Exception:
                     next_items = []
 
+            # 합치기/중복제거
             all_map = {}
             for it in (json_items or []):
                 all_map[it["title"] + "|" + it["url"]] = it
@@ -269,7 +309,7 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 
 # ===========================
-# 기사 컨텍스트(간단 OG + 본문 일부)
+# 기사 컨텍스트(OG + 본문 일부)
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
     with sync_playwright() as p:
@@ -280,9 +320,11 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
         context = browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1280, "height": 720})
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         page = context.new_page()
+
         try:
             page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1500)
+
             data = page.evaluate(
                 """() => {
                     function metaBy(sel) {
@@ -290,10 +332,7 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
                       return el ? (el.getAttribute('content') || '') : '';
                     }
                     function pickBody() {
-                      const selectors = [
-                        '#articleBodyContents','div#dic_area','div._article_content',
-                        'div.article_body','article','main'
-                      ];
+                      const selectors = ['#articleBodyContents','div#dic_area','div._article_content','div.article_body','article','main'];
                       let best = '';
                       for (const sel of selectors) {
                         const el = document.querySelector(sel);
@@ -304,6 +343,7 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
                       if (!best) best = (document.body && document.body.innerText) ? document.body.innerText : '';
                       return best;
                     }
+
                     const og_title = metaBy('meta[property="og:title"]');
                     const og_description = metaBy('meta[property="og:description"]');
                     const published = metaBy('meta[property="article:published_time"]') || metaBy('meta[name="article:published_time"]');
@@ -311,6 +351,7 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
                     return { og_title, og_description, published_time: published, body_text: body };
                 }"""
             )
+
             return {
                 "final_url": page.url,
                 "og_title": _clean_text(data.get("og_title", ""))[:200],
@@ -324,15 +365,15 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
 
 
 # ===========================
-# 대본: OpenAI(구조화 JSON) + 폴백
+# 대본 생성: 템플릿(폴백)
 # ===========================
 def build_60s_shorts_script_template(inputs: dict[str, Any]) -> dict[str, Any]:
     topic = inputs["topic"]
     beats = [
         {"t": "0-2s", "voice": f"오늘 연예 랭킹 한 줄 요약! {topic}", "onscreen": "오늘 랭킹", "broll": "ranking scroll"},
-        {"t": "2-10s", "voice": "왜 뜨는지 제목과 요약 기준으로만 핵심을 볼게요.", "onscreen": "왜 뜸?", "broll": "news keywords"},
-        {"t": "10-25s", "voice": "포인트 1. 사람들이 멈춰보는 키워드가 들어가 있어요.", "onscreen": "포인트1", "broll": "headline highlight"},
-        {"t": "25-40s", "voice": "포인트 2. 댓글과 공유가 생기는 지점이 있어요.", "onscreen": "포인트2", "broll": "social comments"},
+        {"t": "2-10s", "voice": "왜 뜨는지 제목/요약 기준으로 핵심만 볼게요.", "onscreen": "왜 뜸?", "broll": "news keywords"},
+        {"t": "10-25s", "voice": "포인트 1. 사람들이 멈춰보는 키워드가 있어요.", "onscreen": "포인트1", "broll": "headline highlight"},
+        {"t": "25-40s", "voice": "포인트 2. 댓글·공유가 생길 포인트가 보여요.", "onscreen": "포인트2", "broll": "social comments"},
         {"t": "40-55s", "voice": "포인트 3. 다음 이슈로 이어질 흐름이 보입니다.", "onscreen": "포인트3", "broll": "news collage"},
         {"t": "55-60s", "voice": "내일 랭킹도 자동으로 정리할게요. 구독!", "onscreen": "구독!", "broll": "subscribe button"},
     ]
@@ -347,11 +388,12 @@ def build_60s_shorts_script_template(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ===========================
+# 대본 생성: OpenAI(구조화 JSON) + 폴백
+# ===========================
 def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     from openai import OpenAI
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    max_out = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
     client = OpenAI()
 
     schema = {
@@ -385,11 +427,10 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
 
     system = (
         "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다. "
-        "입력으로 받은 제목/OG설명/본문 발췌/링크 밖의 사실을 단정하지 말고, "
-        "불확실하면 '제목/요약 기준'이라고 표현해라. "
+        "입력(제목/OG설명/본문발췌/링크) 밖의 사실을 단정하지 말고, 불확실하면 '제목/요약 기준'이라고 표현해라. "
         "과장/루머/비방 금지. "
         "정확히 6구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s). "
-        "onscreen은 12자 이내. voice는 읽기 쉽게 짧게."
+        "onscreen은 12자 이내, voice는 짧고 말로 읽기 좋게."
     )
 
     user_payload = {
@@ -400,32 +441,32 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
     resp = client.responses.create(
-        model=model,
+        model=OPENAI_MODEL,
         input=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
         text={"format": {"type": "json_schema", "name": "shorts_script", "strict": True, "schema": schema}},
-        max_output_tokens=max_out,
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
     )
 
     data = json.loads(resp.output_text)
+    data["_generator"] = f"openai:{OPENAI_MODEL}"
 
     # 최소 정리
-    data["_generator"] = f"openai:{model}"
-    if isinstance(data.get("beats"), list):
-        for b in data["beats"]:
-            b["t"] = _clean_text(b.get("t", ""))[:20]
-            b["voice"] = _clean_text(b.get("voice", ""))[:220]
-            b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
-            b["broll"] = _clean_text(b.get("broll", ""))[:80]
+    for b in data.get("beats", []):
+        b["t"] = _clean_text(b.get("t", ""))[:20]
+        b["voice"] = _clean_text(b.get("voice", ""))[:220]
+        b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
+        b["broll"] = _clean_text(b.get("broll", ""))[:80]
     return data
 
 
 # ===========================
-# 이미지 수집(Pexels)
+# 이미지 수집: Pexels
 # ===========================
 PEXELS_LAST_ERROR: dict[str, Any] | None = None
+
 
 def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
     global PEXELS_LAST_ERROR
@@ -440,7 +481,7 @@ def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
         f"?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
     )
     headers = {
-        "Authorization": PEXELS_API_KEY,   # Pexels 문서 방식 :contentReference[oaicite:1]{index=1}
+        "Authorization": PEXELS_API_KEY,
         "User-Agent": UA,
         "Accept": "application/json",
     }
@@ -448,9 +489,7 @@ def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
 
     if isinstance(data, dict) and data.get("_error"):
         PEXELS_LAST_ERROR = data
-        # 응답 원문을 저장(Artifacts로 확인 가능)
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUT_DIR / "pexels_api_error.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json(OUT_DIR / "pexels_api_error.json", data)
         return []
 
     photos = (data or {}).get("photos", []) if isinstance(data, dict) else []
@@ -458,38 +497,31 @@ def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
 
 
 def build_image_queries_fallback(beats: list[dict[str, Any]]) -> list[str]:
-    """
-    OpenAI가 없어도 무조건 결과가 뜨도록,
-    구간별로 '스톡에서 잘 나오는' 영어 쿼리를 고정 제공.
-    """
     base = [
-        "K-pop celebrity news on smartphone",
-        "reporter writing entertainment news",
-        "people reading news on phone indoors",
+        "people reading entertainment news on phone",
+        "reporter writing celebrity news article",
+        "trending news headline on smartphone screen",
         "social media comments scrolling close up",
         "entertainment news collage montage",
         "subscribe button on screen close up",
     ]
-    if len(beats) == 6:
-        return base
-    return base[: max(1, len(beats))]
+    return base[:6] if len(beats) >= 6 else base[: max(1, len(beats))]
 
 
 def generate_image_queries_openai(shorts: dict[str, Any]) -> list[str]:
-    """
-    OpenAI가 있으면 beats(broll/voice/onscreen)를 보고
-    Pexels용 영어 검색어 6개를 만듦. 실패하면 예외.
-    """
     from openai import OpenAI
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     client = OpenAI()
-
     schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "queries": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "string"}}
+            "queries": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {"type": "string"},
+            }
         },
         "required": ["queries"],
     }
@@ -515,7 +547,7 @@ def generate_image_queries_openai(shorts: dict[str, Any]) -> list[str]:
     }
 
     resp = client.responses.create(
-        model=model,
+        model=OPENAI_MODEL,
         input=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -524,7 +556,7 @@ def generate_image_queries_openai(shorts: dict[str, Any]) -> list[str]:
         max_output_tokens=300,
     )
     data = json.loads(resp.output_text)
-    queries = [ _clean_text(q)[:90] for q in data["queries"] ]
+    queries = [_clean_text(q)[:90] for q in data["queries"]]
     if len(queries) != 6:
         raise RuntimeError("OpenAI image queries length != 6")
     return queries
@@ -537,9 +569,10 @@ def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
     if not PEXELS_API_KEY:
         raise RuntimeError("PEXELS_API_KEY가 없습니다. GitHub Secrets에 PEXELS_API_KEY를 추가하세요.")
 
-    # 1) OpenAI로 쿼리 생성 시도(있으면 품질↑)
-    queries = None
-    if os.getenv("OPENAI_API_KEY"):
+    queries: list[str] | None = None
+
+    # OpenAI로 쿼리 생성(가능하면)
+    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
         try:
             queries = generate_image_queries_openai(ctx["shorts"])
             _write_json(OUT_DIR / "image_queries.json", {"source": "openai", "queries": queries})
@@ -547,7 +580,7 @@ def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
             _write_text(OUT_DIR / "image_query_error.txt", str(e))
             queries = None
 
-    # 2) 실패/키 없음이면 고정 쿼리로 폴백
+    # 폴백
     if not queries:
         queries = build_image_queries_fallback(beats)
         _write_json(OUT_DIR / "image_queries.json", {"source": "fallback", "queries": queries})
@@ -561,7 +594,7 @@ def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
 
         photos = pexels_search(q, per_page=PEXELS_PER_PAGE)
         if not photos:
-            results.append({"beat": i + 1, "query": q, "ok": False, "reason": "no_results"})
+            results.append({"beat": i + 1, "query": q, "ok": False, "reason": "no_results_or_error"})
             continue
 
         ranked = sorted(photos, key=score_photo, reverse=True)
@@ -594,12 +627,7 @@ def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
         results.append(rec)
         files.append(str(out_path))
 
-    manifest = {
-        "topic": topic,
-        "provider": "pexels",
-        "images": results,
-        "files": files,
-    }
+    manifest = {"topic": topic, "provider": "pexels", "images": results, "files": files}
     _write_json(OUT_DIR / "images_manifest.json", manifest)
     return manifest
 
@@ -609,11 +637,7 @@ def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
 # ===========================
 def node_load_inputs(ctx: dict[str, Any]):
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
-    ctx["inputs"] = {
-        "topic": title,
-        "source_url": article_url,
-        "ranking_page": ranking_url,
-    }
+    ctx["inputs"] = {"topic": title, "source_url": article_url, "ranking_page": ranking_url}
     try:
         ctx["inputs"]["article_context"] = fetch_article_context(article_url)
     except Exception as e:
@@ -623,10 +647,8 @@ def node_load_inputs(ctx: dict[str, Any]):
 
 def node_make_script(ctx: dict[str, Any]):
     inputs = ctx["inputs"]
-    use_openai = os.getenv("USE_OPENAI", "1") == "1"
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
 
-    if use_openai and has_key:
+    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
         try:
             ctx["shorts"] = build_60s_shorts_script_openai(inputs)
             return "COLLECT_IMAGES"
@@ -641,9 +663,7 @@ def node_collect_images(ctx: dict[str, Any]):
     try:
         ctx["images"] = collect_images_from_pexels(ctx)
     except Exception:
-        # 이미지 수집 실패해도 전체 런은 계속 진행(대본/로그는 남김)
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUT_DIR / "images_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        _write_text(OUT_DIR / "images_error.txt", traceback.format_exc())
         ctx["images"] = {"provider": "pexels", "ok": False, "error": "collect_images_failed"}
     return "SAVE_FILES"
 
@@ -659,34 +679,32 @@ def node_save_files(ctx: dict[str, Any]):
     src = ctx["inputs"]
     shorts = ctx["shorts"]
 
-    txt = []
-    txt.append(f"DATE(KST): {kst.isoformat()}")
-    txt.append(f"GENERATOR: {shorts.get('_generator')}")
-    txt.append(f"TOPIC: {shorts.get('topic')}")
-    txt.append(f"SOURCE_URL: {src.get('source_url')}")
-    txt.append(f"RANKING_PAGE: {src.get('ranking_page')}")
+    lines: list[str] = []
+    lines.append(f"DATE(KST): {kst.isoformat()}")
+    lines.append(f"GENERATOR: {shorts.get('_generator')}")
+    lines.append(f"TOPIC: {shorts.get('topic')}")
+    lines.append(f"SOURCE_URL: {src.get('source_url')}")
+    lines.append(f"RANKING_PAGE: {src.get('ranking_page')}")
+
     ac = src.get("article_context") or {}
-    txt.append(f"ARTICLE_OG_TITLE: {ac.get('og_title','')}")
-    txt.append(f"ARTICLE_OG_DESC: {ac.get('og_description','')}")
-    txt.append("")
+    lines.append(f"ARTICLE_OG_TITLE: {ac.get('og_title','')}")
+    lines.append(f"ARTICLE_OG_DESC: {ac.get('og_description','')}")
+    lines.append("")
 
     for b in shorts.get("beats", []):
-        txt.append(f'[{b.get("t")}] {b.get("voice")}')
-        txt.append(f'  - ONSCREEN: {b.get("onscreen")}')
-        txt.append(f'  - BROLL: {b.get("broll")}')
-    txt.append("")
-    txt.append("TITLE_SHORT: " + (shorts.get("title_short") or ""))
-    txt.append("DESCRIPTION: " + (shorts.get("description") or ""))
-    txt.append("NOTES: " + (shorts.get("notes") or ""))
-    txt.append("")
-    txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
-    txt.append("")
-    if "images" in ctx:
-        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
-        txt.append(f"IMAGES: {ok}/6 saved to outputs/images/")
-        txt.append("IMAGES_MANIFEST: outputs/images_manifest.json")
+        lines.append(f'[{b.get("t")}] {b.get("voice")}')
+        lines.append(f'  - ONSCREEN: {b.get("onscreen")}')
+        lines.append(f'  - BROLL: {b.get("broll")}')
+    lines.append("")
+    lines.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
 
-    _write_text(script_path, "\n".join(txt))
+    if "images" in ctx and isinstance(ctx["images"], dict):
+        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
+        lines.append("")
+        lines.append(f"IMAGES: {ok}/6 -> outputs/images/")
+        lines.append("IMAGES_MANIFEST: outputs/images_manifest.json")
+
+    _write_text(script_path, "\n".join(lines))
 
     meta = {
         "date_kst": kst.isoformat(),
@@ -696,7 +714,7 @@ def node_save_files(ctx: dict[str, Any]):
         "images": ctx.get("images", {}),
         "files": {"script": str(script_path), "meta": str(meta_path)},
     }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json(meta_path, meta)
 
     ctx["outputs"] = {"script_path": str(script_path), "meta_path": str(meta_path)}
     return "PRINT"
@@ -706,7 +724,7 @@ def node_print(ctx: dict[str, Any]):
     log("TOPIC: " + ctx["inputs"]["topic"])
     log("SOURCE_URL: " + ctx["inputs"]["source_url"])
     log("GENERATOR: " + str(ctx["shorts"].get("_generator")))
-    if "images" in ctx:
+    if "images" in ctx and isinstance(ctx["images"], dict):
         ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
         log(f"IMAGES: {ok}/6 -> outputs/images/")
     log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
@@ -724,12 +742,15 @@ flow.add(Node("COLLECT_IMAGES", node_collect_images))
 flow.add(Node("SAVE_FILES", node_save_files))
 flow.add(Node("PRINT", node_print))
 
+flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
+flow.connect("MAKE_SCRIPT", "COLLECT_IMAGES")
+flow.connect("COLLECT_IMAGES", "SAVE_FILES")
+flow.connect("SAVE_FILES", "PRINT")
+
 if __name__ == "__main__":
     try:
-        ctx = flow.run("LOAD_INPUTS")
+        flow.run("LOAD_INPUTS")
         log("\n[끝] OK")
     except Exception:
-        (OUT_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
-
-
