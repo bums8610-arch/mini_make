@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,7 +26,8 @@ PEOPLE_DIR = IMG_DIR / "people"
 ARTICLE_DIR = IMG_DIR / "article"
 FILL_DIR = IMG_DIR / "fill"
 FINAL_DIR = IMG_DIR / "final"
-for d in (OUT_DIR, IMG_DIR, PEOPLE_DIR, ARTICLE_DIR, FILL_DIR, FINAL_DIR):
+VIDEO_WORK = OUT_DIR / "video_work"
+for d in (OUT_DIR, IMG_DIR, PEOPLE_DIR, ARTICLE_DIR, FILL_DIR, FINAL_DIR, VIDEO_WORK):
     d.mkdir(parents=True, exist_ok=True)
 
 RANKING_URL = os.getenv("RANKING_URL", "https://m.entertain.naver.com/ranking").strip()
@@ -35,9 +37,15 @@ UA = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 )
 
-# OpenAI
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+# OpenAI (대본)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")  # 최신으로 쓰려면 여기 or workflow env에서 지정
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
+
+# OpenAI (TTS)
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")  # 추천: marin/cedar 등
+OPENAI_TTS_SPEED = float(os.getenv("OPENAI_TTS_SPEED", "1.0"))
+OPENAI_TTS_RESPONSE_FORMAT = os.getenv("OPENAI_TTS_RESPONSE_FORMAT", "mp3")
 
 # 이미지 수집 옵션
 DOWNLOAD_PERSON_IMAGES = os.getenv("DOWNLOAD_PERSON_IMAGES", "1").strip() == "1"
@@ -45,8 +53,24 @@ DOWNLOAD_ARTICLE_IMAGES = os.getenv("DOWNLOAD_ARTICLE_IMAGES", "0").strip() == "
 MAX_PEOPLE = int(os.getenv("MAX_PEOPLE", "5"))
 MAX_ARTICLE_IMAGES = int(os.getenv("MAX_ARTICLE_IMAGES", "12"))
 
-# ✅ 최종 이미지 고정 개수
-FIXED_IMAGE_COUNT = int(os.getenv("FIXED_IMAGE_COUNT", "8"))  # 요청: 8장 고정
+# 최종 이미지 고정 개수
+FIXED_IMAGE_COUNT = int(os.getenv("FIXED_IMAGE_COUNT", "8"))
+
+# 영상 설정
+VIDEO_W = int(os.getenv("VIDEO_W", "1080"))
+VIDEO_H = int(os.getenv("VIDEO_H", "1920"))
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
+BURN_ONSCREEN_TEXT = os.getenv("BURN_ONSCREEN_TEXT", "1").strip() == "1"
+
+# 60초 타임라인(6구간)
+SEGMENTS = [
+    ("0-2s", 2),
+    ("2-10s", 8),
+    ("10-25s", 15),
+    ("25-40s", 15),
+    ("40-55s", 15),
+    ("55-60s", 5),
+]
 
 
 def log(msg: str) -> None:
@@ -113,6 +137,11 @@ def _http_json(url: str, headers: Optional[dict[str, str]] = None, timeout: int 
         return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
     except Exception as e:
         return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
+
+
+def run_cmd(cmd: list[str], *, cwd: Optional[Path] = None) -> None:
+    log("[cmd] " + " ".join(cmd))
+    subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None)
 
 
 # ===========================
@@ -297,11 +326,10 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 
 # ===========================
-# 2) 기사 컨텍스트(OG + 본문 일부 + og:image) — 타임아웃 방지 버전
+# 2) 기사 컨텍스트(OG + 본문 일부 + og:image) — 타임아웃 방지
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
     def meta_content(page, selector: str) -> str:
-        # locator로 기다리지 않고, 없으면 즉시 ""
         try:
             el = page.query_selector(selector)
             if not el:
@@ -402,19 +430,14 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
                     "required": ["t", "voice", "onscreen"],
                 },
             },
-            "people": {
-                "type": "array",
-                "minItems": 0,
-                "maxItems": MAX_PEOPLE,
-                "items": {"type": "string"},
-            },
+            "people": {"type": "array", "minItems": 0, "maxItems": MAX_PEOPLE, "items": {"type": "string"}},
             "hashtags": {"type": "array", "minItems": 4, "maxItems": 10, "items": {"type": "string"}},
             "notes": {"type": "string"},
         },
         "required": ["topic", "title_short", "description", "beats", "people", "hashtags", "notes"],
     }
 
-    time_slots = ["0-2s", "2-10s", "10-25s", "25-40s", "40-55s", "55-60s"]
+    time_slots = [x[0] for x in SEGMENTS]
 
     system = (
         "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다.\n"
@@ -453,7 +476,7 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
 
     for i, b in enumerate(beats):
         b["t"] = time_slots[i]
-        b["voice"] = _clean_text(b.get("voice", ""))[:240]
+        b["voice"] = _clean_text(b.get("voice", ""))[:260]
         b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
 
     ppl = data.get("people")
@@ -508,7 +531,6 @@ def download_people_images(ctx: dict[str, Any]) -> dict[str, Any]:
     people = (ctx.get("shorts") or {}).get("people") or []
     if not DOWNLOAD_PERSON_IMAGES:
         return {"ok": False, "skipped": True, "reason": "DOWNLOAD_PERSON_IMAGES=0"}
-
     if not isinstance(people, list) or not people:
         return {"ok": True, "people": [], "files": []}
 
@@ -630,49 +652,32 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 # ===========================
-# 6) 부족하면 자동 생성 카드(PNG)로 채워서 최종 8장 고정
+# 6) 부족하면 카드(PNG) 생성으로 채워서 최종 8장 고정
 # ===========================
 def _render_card_png(path: Path, title: str, subtitle: str) -> bool:
-    # Playwright로 간단한 HTML 카드 렌더 -> screenshot PNG
     html = f"""
     <html><head><meta charset="utf-8"/>
     <style>
       body {{
-        margin:0; width:1080px; height:1920px;
+        margin:0; width:{VIDEO_W}px; height:{VIDEO_H}px;
         background: linear-gradient(160deg, #0b0f1a, #1a1030);
         font-family: Arial, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
-        color: #ffffff;
-        display:flex; align-items:center; justify-content:center;
+        color: #ffffff; display:flex; align-items:center; justify-content:center;
       }}
       .card {{
-        width: 920px; height: 1640px;
-        border-radius: 48px;
+        width: 920px; height: 1640px; border-radius: 48px;
         background: rgba(255,255,255,0.06);
         box-shadow: 0 30px 80px rgba(0,0,0,0.45);
         border: 1px solid rgba(255,255,255,0.10);
-        padding: 96px 72px;
-        box-sizing:border-box;
+        padding: 96px 72px; box-sizing:border-box;
         display:flex; flex-direction:column; justify-content:space-between;
       }}
-      .kicker {{
-        font-size: 44px; opacity: 0.85; letter-spacing: 0.5px;
-      }}
-      .title {{
-        margin-top: 24px;
-        font-size: 86px; font-weight: 800; line-height: 1.06;
-      }}
-      .subtitle {{
-        margin-top: 36px;
-        font-size: 48px; opacity: 0.9; line-height: 1.3;
-        white-space: pre-wrap;
-      }}
-      .footer {{
-        font-size: 34px; opacity: 0.65;
-        display:flex; justify-content:space-between;
-      }}
+      .kicker {{ font-size: 44px; opacity: 0.85; }}
+      .title {{ margin-top: 24px; font-size: 86px; font-weight: 800; line-height: 1.06; }}
+      .subtitle {{ margin-top: 36px; font-size: 48px; opacity: 0.9; line-height: 1.3; white-space: pre-wrap; }}
+      .footer {{ font-size: 34px; opacity: 0.65; display:flex; justify-content:space-between; }}
       .pill {{
-        padding: 16px 26px;
-        border-radius: 999px;
+        padding: 16px 26px; border-radius: 999px;
         background: rgba(255,255,255,0.08);
         border: 1px solid rgba(255,255,255,0.10);
       }}
@@ -693,11 +698,8 @@ def _render_card_png(path: Path, title: str, subtitle: str) -> bool:
     """.strip()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        page = browser.new_page(viewport={"width": 1080, "height": 1920})
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        page = browser.new_page(viewport={"width": VIDEO_W, "height": VIDEO_H})
         try:
             page.set_content(html, wait_until="domcontentloaded")
             page.wait_for_timeout(300)
@@ -709,7 +711,6 @@ def _render_card_png(path: Path, title: str, subtitle: str) -> bool:
 
 
 def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
-    # 1) 후보 파일 모으기(사람 -> 기사)
     cand: list[dict[str, Any]] = []
     downloads = ctx.get("downloads") or {}
 
@@ -721,7 +722,6 @@ def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
     for f in art_files:
         cand.append({"kind": "article", "path": f})
 
-    # dedupe
     seen = set()
     uniq: list[dict[str, Any]] = []
     for it in cand:
@@ -731,11 +731,9 @@ def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
         seen.add(p)
         uniq.append(it)
 
-    # 2) 8장 넘으면 8장만
     chosen = uniq[:FIXED_IMAGE_COUNT]
-
-    # 3) 부족하면 fill 카드 생성으로 채우기
     need = FIXED_IMAGE_COUNT - len(chosen)
+
     if need > 0:
         topic = _clean_text((ctx.get("shorts") or {}).get("topic") or (ctx.get("inputs") or {}).get("topic") or "")
         beats = (ctx.get("shorts") or {}).get("beats") or []
@@ -750,41 +748,23 @@ def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
             subtitle = ons[i % len(ons)] if ons else "핵심만 빠르게 정리"
             path = FILL_DIR / f"fill_{i+1:02d}.png"
             ok = _render_card_png(path, title=(topic or "오늘의 연예 랭킹"), subtitle=subtitle)
-            if ok:
-                chosen.append({"kind": "fill", "path": str(path)})
-            else:
-                # 최후: 빈 파일 방지용(이 경우 런 실패)
+            if not ok:
                 raise RuntimeError("fill 이미지 생성 실패")
+            chosen.append({"kind": "fill", "path": str(path)})
 
-    # 4) 최종 8장을 final 폴더에 01~08로 고정 복사(확장자 png로 통일)
-    final_items = []
-    FINAL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # final 폴더 초기화(이전 파일이 섞이지 않게)
+    # final 폴더 초기화
     for old in FINAL_DIR.glob("*"):
         try:
             old.unlink()
         except Exception:
             pass
 
+    final_items = []
     for idx, it in enumerate(chosen, start=1):
         src = Path(str(it["path"]))
-        dst = FINAL_DIR / f"{idx:02d}.png"
-        if src.suffix.lower() == ".png":
-            dst.write_bytes(src.read_bytes())
-        else:
-            # jpg/webp 등은 playwright로 다시 png로 변환
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                page = browser.new_page(viewport={"width": 1080, "height": 1920})
-                try:
-                    # file:// 로 로드해서 스크린샷으로 png 통일
-                    page.goto(f"file://{src.resolve()}")
-                    page.wait_for_timeout(200)
-                    page.screenshot(path=str(dst), full_page=True)
-                finally:
-                    browser.close()
-
+        dst = FINAL_DIR / f"{idx:02d}{src.suffix.lower()}"
+        dst.write_bytes(src.read_bytes())
+        # 확장자 통일이 필요하면 여기서 변환해도 됨(현재는 원본 확장자 유지)
         final_items.append({"index": idx, "kind": it["kind"], "path": str(dst)})
 
     manifest = {"ok": True, "count": FIXED_IMAGE_COUNT, "items": final_items, "final_dir": str(FINAL_DIR)}
@@ -793,11 +773,183 @@ def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 # ===========================
+# 7) TTS(음성) 생성: OpenAI /v1/audio/speech
+# ===========================
+def make_voice_mp3(shorts: dict[str, Any]) -> Path:
+    _require_openai_key()
+
+    beats = shorts.get("beats") or []
+    lines = []
+    for b in beats:
+        v = _clean_text((b or {}).get("voice") or "")
+        if v:
+            lines.append(v)
+    text = "\n".join(lines).strip()
+    if not text:
+        raise RuntimeError("TTS 입력 텍스트가 비었습니다(beats.voice 없음).")
+
+    url = "https://api.openai.com/v1/audio/speech"
+    payload = {
+        "model": OPENAI_TTS_MODEL,
+        "voice": OPENAI_TTS_VOICE,
+        "input": text,
+        "response_format": OPENAI_TTS_RESPONSE_FORMAT,
+        "speed": OPENAI_TTS_SPEED,
+    }
+
+    req = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+        },
+        method="POST",
+    )
+
+    out_path = OUT_DIR / f"voice.{OPENAI_TTS_RESPONSE_FORMAT}"
+    try:
+        with urlopen(req, timeout=120) as resp:
+            out_path.write_bytes(resp.read())
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(f"TTS HTTPError {e.code}: {body[:2000]}") from e
+
+    _write_text(OUT_DIR / "voice_text.txt", text)
+    return out_path
+
+
+def find_korean_font_file() -> str:
+    # Ubuntu runner + fonts-noto-cjk 설치 가정
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return p
+
+    # fallback: 시스템 폰트 중 첫 번째 ttc/ttf
+    for p in Path("/usr/share/fonts").rglob("*"):
+        if p.suffix.lower() in (".ttf", ".ttc", ".otf"):
+            return str(p)
+    return ""
+
+
+# ===========================
+# 8) 영상 생성(60초): 이미지(6장 사용) + onscreen 텍스트 + 음성 합치기
+# ===========================
+def make_video(shorts: dict[str, Any], voice_path: Path) -> dict[str, Any]:
+    # 이미지 01~08 중 01~06을 6구간에 사용
+    img_paths = []
+    for i in range(1, 7):
+        # 확장자는 고정하지 않고 glob로 찾음
+        matches = list(FINAL_DIR.glob(f"{i:02d}.*"))
+        if not matches:
+            raise RuntimeError(f"final 이미지 없음: outputs/images/final/{i:02d}.*")
+        img_paths.append(matches[0])
+
+    fontfile = find_korean_font_file()
+    if BURN_ONSCREEN_TEXT and not fontfile:
+        raise RuntimeError("한글 폰트 파일을 찾지 못했습니다. workflow에서 fonts-noto-cjk 설치 필요")
+
+    beats = shorts.get("beats") or []
+    if not isinstance(beats, list) or len(beats) != 6:
+        raise RuntimeError("beats가 6개가 아닙니다.")
+
+    # 작업 폴더 초기화
+    for old in VIDEO_WORK.glob("*"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+    segment_files: list[Path] = []
+    for idx, ((slot, dur), img, beat) in enumerate(zip(SEGMENTS, img_paths, beats), start=1):
+        ons = _clean_text((beat or {}).get("onscreen") or "")
+        textfile = VIDEO_WORK / f"text_{idx:02d}.txt"
+        _write_text(textfile, ons if ons else " ")
+
+        seg_out = VIDEO_WORK / f"seg_{idx:02d}.mp4"
+
+        vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},format=yuv420p"
+        if BURN_ONSCREEN_TEXT:
+            # textfile 사용(escape 지옥 회피). drawtext는 textfile 권장. :contentReference[oaicite:2]{index=2}
+            vf += (
+                f",drawtext=fontfile='{fontfile}':textfile='{textfile}':"
+                f"x=(w-text_w)/2:y=h*0.12:fontsize=64:fontcolor=white:"
+                f"box=1:boxcolor=black@0.35:boxborderw=22"
+            )
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-t",
+            str(dur),
+            "-i",
+            str(img),
+            "-vf",
+            vf,
+            "-r",
+            str(VIDEO_FPS),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(seg_out),
+        ]
+        run_cmd(cmd)
+        segment_files.append(seg_out)
+
+    # concat
+    concat_list = VIDEO_WORK / "concat.txt"
+    lines = [f"file '{p.name}'" for p in segment_files]
+    _write_text(concat_list, "\n".join(lines) + "\n")
+
+    silent_video = OUT_DIR / "video_silent.mp4"
+    try:
+        run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(silent_video)], cwd=VIDEO_WORK)
+    except Exception:
+        run_cmd(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(VIDEO_FPS), str(silent_video)],
+            cwd=VIDEO_WORK,
+        )
+
+    # audio + video merge
+    final_video = OUT_DIR / "video.mp4"
+    try:
+        run_cmd(
+            ["ffmpeg", "-y", "-i", str(silent_video), "-i", str(voice_path), "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(final_video)]
+        )
+    except Exception:
+        run_cmd(
+            ["ffmpeg", "-y", "-i", str(silent_video), "-i", str(voice_path), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", str(final_video)]
+        )
+
+    return {
+        "ok": True,
+        "video": str(final_video),
+        "voice": str(voice_path),
+        "silent_video": str(silent_video),
+        "segments": [str(p) for p in segment_files],
+    }
+
+
+# ===========================
 # Nodes
 # ===========================
 def node_load_inputs(ctx: dict[str, Any]) -> None:
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
-
     try:
         article_ctx = fetch_article_context(article_url)
     except Exception as e:
@@ -820,22 +972,30 @@ def node_make_script(ctx: dict[str, Any]) -> None:
 def node_download_images(ctx: dict[str, Any]) -> None:
     ctx["downloads"] = {}
 
-    # people
     try:
         ctx["downloads"]["people"] = download_people_images(ctx)
     except Exception:
         _write_text(OUT_DIR / "people_images_error.txt", traceback.format_exc())
         ctx["downloads"]["people"] = {"ok": False, "error": "people_images_failed"}
 
-    # article (optional)
     try:
         ctx["downloads"]["article"] = download_article_images(ctx)
     except Exception:
         _write_text(OUT_DIR / "article_images_error.txt", traceback.format_exc())
         ctx["downloads"]["article"] = {"ok": False, "error": "article_images_failed"}
 
-    # ✅ 최종 8장 고정 생성
     ctx["images_fixed"] = ensure_fixed_8_images(ctx)
+
+
+def node_make_voice(ctx: dict[str, Any]) -> None:
+    voice_path = make_voice_mp3(ctx["shorts"])
+    ctx["voice_path"] = str(voice_path)
+
+
+def node_make_video(ctx: dict[str, Any]) -> None:
+    voice_path = Path(ctx["voice_path"])
+    ctx["video"] = make_video(ctx["shorts"], voice_path)
+    _write_json(OUT_DIR / "video_manifest.json", ctx["video"])
 
 
 def node_save_files(ctx: dict[str, Any]) -> None:
@@ -847,6 +1007,7 @@ def node_save_files(ctx: dict[str, Any]) -> None:
     shorts = ctx["shorts"]
     downloads = ctx.get("downloads", {})
     fixed = ctx.get("images_fixed", {})
+    video = ctx.get("video", {})
 
     script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
     meta_path = OUT_DIR / f"meta_{stamp}_{run_id}.json"
@@ -871,11 +1032,12 @@ def node_save_files(ctx: dict[str, Any]) -> None:
     txt.append("")
     txt.append("PEOPLE: " + ", ".join(shorts.get("people", [])))
     txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
-
     txt.append("")
-    txt.append(f"FIXED_IMAGES: {fixed.get('count')} -> outputs/images/final/01.png ~ 08.png")
-    txt.append(f"DOWNLOAD_ARTICLE_IMAGES: {int(DOWNLOAD_ARTICLE_IMAGES)} (기사 이미지도 필요하면 1로)")
-    txt.append(f"DOWNLOAD_PERSON_IMAGES: {int(DOWNLOAD_PERSON_IMAGES)}")
+    txt.append(f"FIXED_IMAGES: {fixed.get('count')} -> outputs/images/final/")
+    txt.append(f"VOICE: outputs/{Path(ctx.get('voice_path','')).name}")
+    txt.append("VIDEO: outputs/video.mp4")
+    txt.append("")
+    txt.append("NOTE: 업로드/설명란에 'AI 음성' 사용 고지 권장")
 
     script_path.write_text("\n".join(txt), encoding="utf-8")
 
@@ -886,6 +1048,8 @@ def node_save_files(ctx: dict[str, Any]) -> None:
         "shorts": shorts,
         "downloads": downloads,
         "images_fixed": fixed,
+        "voice_path": ctx.get("voice_path"),
+        "video": video,
         "files": {"script": str(script_path), "meta": str(meta_path)},
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -894,8 +1058,11 @@ def node_save_files(ctx: dict[str, Any]) -> None:
 
 def node_print(ctx: dict[str, Any]) -> None:
     log("TOPIC: " + ctx["inputs"]["topic"])
-    log("PEOPLE: " + ", ".join(ctx["shorts"].get("people", [])))
-    log("FINAL IMAGES: outputs/images/final/01.png ~ 08.png")
+    log("MODEL: " + OPENAI_MODEL)
+    log("TTS: " + OPENAI_TTS_MODEL + " / " + OPENAI_TTS_VOICE)
+    log("FINAL IMAGES: outputs/images/final/01.* ~ 08.*")
+    log("VOICE: " + str(ctx.get("voice_path")))
+    log("VIDEO: outputs/video.mp4")
     log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
     log("META FILE: " + ctx["outputs"]["meta_path"])
 
@@ -905,12 +1072,16 @@ def build_flow() -> Flow:
     flow.add(Node("LOAD_INPUTS", node_load_inputs))
     flow.add(Node("MAKE_SCRIPT", node_make_script))
     flow.add(Node("DOWNLOAD_IMAGES", node_download_images))
+    flow.add(Node("MAKE_VOICE", node_make_voice))
+    flow.add(Node("MAKE_VIDEO", node_make_video))
     flow.add(Node("SAVE_FILES", node_save_files))
     flow.add(Node("PRINT", node_print))
 
     flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
     flow.connect("MAKE_SCRIPT", "DOWNLOAD_IMAGES")
-    flow.connect("DOWNLOAD_IMAGES", "SAVE_FILES")
+    flow.connect("DOWNLOAD_IMAGES", "MAKE_VOICE")
+    flow.connect("MAKE_VOICE", "MAKE_VIDEO")
+    flow.connect("MAKE_VIDEO", "SAVE_FILES")
     flow.connect("SAVE_FILES", "PRINT")
     return flow
 
@@ -922,4 +1093,3 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
-
