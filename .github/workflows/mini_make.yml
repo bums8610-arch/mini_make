@@ -2,13 +2,9 @@ name: mini_make_daily
 
 on:
   schedule:
-    # KST 09:07, 11:07, 14:07, 17:07, 22:07  (UTC = KST-9)
-    - cron: "7 0 * * *"
-    - cron: "7 2 * * *"
-    - cron: "7 5 * * *"
-    - cron: "7 8 * * *"
-    - cron: "7 13 * * *"
-  workflow_dispatch: {}
+    # KST 11:07,  (UTC = KST-9)
+     - cron: "7 2 * * *"
+     workflow_dispatch: {}
 
 jobs:
   run:
