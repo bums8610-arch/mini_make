@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-
 # =========================
 # 기본 설정
 # =========================
@@ -24,7 +23,9 @@ OUT_DIR = Path("outputs")
 IMG_DIR = OUT_DIR / "images"
 PEOPLE_DIR = IMG_DIR / "people"
 ARTICLE_DIR = IMG_DIR / "article"
-for d in (OUT_DIR, IMG_DIR, PEOPLE_DIR, ARTICLE_DIR):
+FILL_DIR = IMG_DIR / "fill"
+FINAL_DIR = IMG_DIR / "final"
+for d in (OUT_DIR, IMG_DIR, PEOPLE_DIR, ARTICLE_DIR, FILL_DIR, FINAL_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 RANKING_URL = os.getenv("RANKING_URL", "https://m.entertain.naver.com/ranking").strip()
@@ -42,7 +43,10 @@ OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 DOWNLOAD_PERSON_IMAGES = os.getenv("DOWNLOAD_PERSON_IMAGES", "1").strip() == "1"
 DOWNLOAD_ARTICLE_IMAGES = os.getenv("DOWNLOAD_ARTICLE_IMAGES", "0").strip() == "1"
 MAX_PEOPLE = int(os.getenv("MAX_PEOPLE", "5"))
-MAX_ARTICLE_IMAGES = int(os.getenv("MAX_ARTICLE_IMAGES", "8"))
+MAX_ARTICLE_IMAGES = int(os.getenv("MAX_ARTICLE_IMAGES", "12"))
+
+# ✅ 최종 이미지 고정 개수
+FIXED_IMAGE_COUNT = int(os.getenv("FIXED_IMAGE_COUNT", "8"))  # 요청: 8장 고정
 
 
 def log(msg: str) -> None:
@@ -293,11 +297,11 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 
 # ===========================
-# 2) 기사 컨텍스트(OG + 본문 일부 + og:image)
+# 2) 기사 컨텍스트(OG + 본문 일부 + og:image) — 타임아웃 방지 버전
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
     def meta_content(page, selector: str) -> str:
-        # locator처럼 '나올 때까지 기다리지 않음' (없으면 바로 "")
+        # locator로 기다리지 않고, 없으면 즉시 ""
         try:
             el = page.query_selector(selector)
             if not el:
@@ -376,7 +380,6 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
     client = OpenAI()
     style = _pick_style()
 
-    # people: 인물명 배열(0~MAX_PEOPLE) — 없으면 빈 배열
     schema: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
@@ -421,7 +424,7 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         "- 정확히 6구간으로 작성: 0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s.\n"
         "- onscreen: 12자 이내(한국어), voice: 한 구간당 1~2문장.\n"
         f"- 전체 톤/스타일: {style}\n"
-        "- people: 기사 제목/발췌에 등장하는 실명 인물만 추려서 배열로 출력. 없으면 [].\n"
+        "- people: 기사 제목/발췌에 등장하는 실명 인물만 배열로 출력. 없으면 [].\n"
         "출력은 반드시 JSON(schema strict)만."
     )
 
@@ -453,7 +456,6 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         b["voice"] = _clean_text(b.get("voice", ""))[:240]
         b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
 
-    # people 정리(중복 제거)
     ppl = data.get("people")
     if not isinstance(ppl, list):
         ppl = []
@@ -479,7 +481,6 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
 # 4) 인물 이미지 다운로드 (Wikipedia ko/en 대표 이미지)
 # ===========================
 def _wiki_page_image(person_name: str, lang: str = "ko") -> dict[str, Any]:
-    # pageimages로 대표 이미지(original) 가져오기
     title = quote_plus(person_name)
     url = (
         f"https://{lang}.wikipedia.org/w/api.php"
@@ -493,7 +494,6 @@ def _wiki_page_image(person_name: str, lang: str = "ko") -> dict[str, Any]:
     if not isinstance(pages, dict) or not pages:
         return {"ok": False, "lang": lang, "error": "no_pages"}
 
-    # pages는 키가 pageid인 dict
     for _, p in pages.items():
         if not isinstance(p, dict):
             continue
@@ -517,7 +517,6 @@ def download_people_images(ctx: dict[str, Any]) -> dict[str, Any]:
 
     for name in people:
         safe = _safe_filename(name)
-        # ko -> en 순서로 시도
         info = _wiki_page_image(name, "ko")
         if not info.get("ok"):
             info = _wiki_page_image(name, "en")
@@ -526,11 +525,11 @@ def download_people_images(ctx: dict[str, Any]) -> dict[str, Any]:
         if info.get("ok") and isinstance(info.get("image_url"), str):
             ext = ".jpg"
             url = info["image_url"]
-            if "." in url.split("?")[0].split("/")[-1]:
-                ext_guess = "." + url.split("?")[0].split("/")[-1].split(".")[-1].lower()
-                if len(ext_guess) <= 5:
-                    ext = ext_guess
-
+            tail = url.split("?")[0].split("/")[-1]
+            if "." in tail:
+                eg = "." + tail.split(".")[-1].lower()
+                if 2 <= len(eg) <= 5:
+                    ext = eg
             path = PEOPLE_DIR / f"{safe}{ext}"
             ok = _download(url, path, timeout=60)
             rec["saved_path"] = str(path) if ok else ""
@@ -574,7 +573,7 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
             img_urls = page.evaluate(
                 """() => {
                     const out = [];
@@ -583,13 +582,11 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
                       const src = im.currentSrc || im.src || '';
                       if (!src) continue;
                       if (!src.startsWith('http')) continue;
-                      // 너무 작은 로고/아이콘 제외
                       const w = im.naturalWidth || im.width || 0;
                       const h = im.naturalHeight || im.height || 0;
                       if (w && h && (w < 200 || h < 200)) continue;
                       out.push(src);
                     }
-                    // 중복 제거
                     return Array.from(new Set(out));
                 }"""
             ) or []
@@ -601,7 +598,6 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
             context.close()
             browser.close()
 
-    # 정리 + 제한
     uniq = []
     seen = set()
     for u in images:
@@ -634,6 +630,169 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 # ===========================
+# 6) 부족하면 자동 생성 카드(PNG)로 채워서 최종 8장 고정
+# ===========================
+def _render_card_png(path: Path, title: str, subtitle: str) -> bool:
+    # Playwright로 간단한 HTML 카드 렌더 -> screenshot PNG
+    html = f"""
+    <html><head><meta charset="utf-8"/>
+    <style>
+      body {{
+        margin:0; width:1080px; height:1920px;
+        background: linear-gradient(160deg, #0b0f1a, #1a1030);
+        font-family: Arial, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+        color: #ffffff;
+        display:flex; align-items:center; justify-content:center;
+      }}
+      .card {{
+        width: 920px; height: 1640px;
+        border-radius: 48px;
+        background: rgba(255,255,255,0.06);
+        box-shadow: 0 30px 80px rgba(0,0,0,0.45);
+        border: 1px solid rgba(255,255,255,0.10);
+        padding: 96px 72px;
+        box-sizing:border-box;
+        display:flex; flex-direction:column; justify-content:space-between;
+      }}
+      .kicker {{
+        font-size: 44px; opacity: 0.85; letter-spacing: 0.5px;
+      }}
+      .title {{
+        margin-top: 24px;
+        font-size: 86px; font-weight: 800; line-height: 1.06;
+      }}
+      .subtitle {{
+        margin-top: 36px;
+        font-size: 48px; opacity: 0.9; line-height: 1.3;
+        white-space: pre-wrap;
+      }}
+      .footer {{
+        font-size: 34px; opacity: 0.65;
+        display:flex; justify-content:space-between;
+      }}
+      .pill {{
+        padding: 16px 26px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.10);
+      }}
+    </style></head>
+    <body>
+      <div class="card">
+        <div>
+          <div class="kicker">NAVER ENTERTAINMENT RANKING</div>
+          <div class="title">{title}</div>
+          <div class="subtitle">{subtitle}</div>
+        </div>
+        <div class="footer">
+          <div class="pill">AUTO SHORTS</div>
+          <div class="pill">{now_kst().strftime("%Y-%m-%d %H:%M KST")}</div>
+        </div>
+      </div>
+    </body></html>
+    """.strip()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = browser.new_page(viewport={"width": 1080, "height": 1920})
+        try:
+            page.set_content(html, wait_until="domcontentloaded")
+            page.wait_for_timeout(300)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(path), full_page=True)
+            return True
+        finally:
+            browser.close()
+
+
+def ensure_fixed_8_images(ctx: dict[str, Any]) -> dict[str, Any]:
+    # 1) 후보 파일 모으기(사람 -> 기사)
+    cand: list[dict[str, Any]] = []
+    downloads = ctx.get("downloads") or {}
+
+    ppl_files = ((downloads.get("people") or {}).get("files") or [])
+    for f in ppl_files:
+        cand.append({"kind": "people", "path": f})
+
+    art_files = ((downloads.get("article") or {}).get("files") or [])
+    for f in art_files:
+        cand.append({"kind": "article", "path": f})
+
+    # dedupe
+    seen = set()
+    uniq: list[dict[str, Any]] = []
+    for it in cand:
+        p = str(it.get("path") or "")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        uniq.append(it)
+
+    # 2) 8장 넘으면 8장만
+    chosen = uniq[:FIXED_IMAGE_COUNT]
+
+    # 3) 부족하면 fill 카드 생성으로 채우기
+    need = FIXED_IMAGE_COUNT - len(chosen)
+    if need > 0:
+        topic = _clean_text((ctx.get("shorts") or {}).get("topic") or (ctx.get("inputs") or {}).get("topic") or "")
+        beats = (ctx.get("shorts") or {}).get("beats") or []
+        ons = []
+        if isinstance(beats, list):
+            for b in beats:
+                t = _clean_text((b or {}).get("onscreen") or "")
+                if t:
+                    ons.append(t)
+
+        for i in range(need):
+            subtitle = ons[i % len(ons)] if ons else "핵심만 빠르게 정리"
+            path = FILL_DIR / f"fill_{i+1:02d}.png"
+            ok = _render_card_png(path, title=(topic or "오늘의 연예 랭킹"), subtitle=subtitle)
+            if ok:
+                chosen.append({"kind": "fill", "path": str(path)})
+            else:
+                # 최후: 빈 파일 방지용(이 경우 런 실패)
+                raise RuntimeError("fill 이미지 생성 실패")
+
+    # 4) 최종 8장을 final 폴더에 01~08로 고정 복사(확장자 png로 통일)
+    final_items = []
+    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # final 폴더 초기화(이전 파일이 섞이지 않게)
+    for old in FINAL_DIR.glob("*"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+    for idx, it in enumerate(chosen, start=1):
+        src = Path(str(it["path"]))
+        dst = FINAL_DIR / f"{idx:02d}.png"
+        if src.suffix.lower() == ".png":
+            dst.write_bytes(src.read_bytes())
+        else:
+            # jpg/webp 등은 playwright로 다시 png로 변환
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                page = browser.new_page(viewport={"width": 1080, "height": 1920})
+                try:
+                    # file:// 로 로드해서 스크린샷으로 png 통일
+                    page.goto(f"file://{src.resolve()}")
+                    page.wait_for_timeout(200)
+                    page.screenshot(path=str(dst), full_page=True)
+                finally:
+                    browser.close()
+
+        final_items.append({"index": idx, "kind": it["kind"], "path": str(dst)})
+
+    manifest = {"ok": True, "count": FIXED_IMAGE_COUNT, "items": final_items, "final_dir": str(FINAL_DIR)}
+    _write_json(OUT_DIR / "images_fixed_manifest.json", manifest)
+    return manifest
+
+
+# ===========================
 # Nodes
 # ===========================
 def node_load_inputs(ctx: dict[str, Any]) -> None:
@@ -642,7 +801,6 @@ def node_load_inputs(ctx: dict[str, Any]) -> None:
     try:
         article_ctx = fetch_article_context(article_url)
     except Exception as e:
-        # 기사 컨텍스트 수집이 실패해도, 대본 생성은 계속 진행
         _write_text(OUT_DIR / "article_context_error.txt", traceback.format_exc())
         article_ctx = {"error": str(e), "final_url": article_url}
 
@@ -653,6 +811,7 @@ def node_load_inputs(ctx: dict[str, Any]) -> None:
         "article_context": article_ctx,
     }
 
+
 def node_make_script(ctx: dict[str, Any]) -> None:
     ctx["shorts"] = build_60s_shorts_script_openai(ctx["inputs"])
     _write_json(OUT_DIR / "shorts.json", ctx["shorts"])
@@ -660,19 +819,23 @@ def node_make_script(ctx: dict[str, Any]) -> None:
 
 def node_download_images(ctx: dict[str, Any]) -> None:
     ctx["downloads"] = {}
-    # 인물 이미지(기본 ON)
+
+    # people
     try:
         ctx["downloads"]["people"] = download_people_images(ctx)
     except Exception:
         _write_text(OUT_DIR / "people_images_error.txt", traceback.format_exc())
         ctx["downloads"]["people"] = {"ok": False, "error": "people_images_failed"}
 
-    # 기사 이미지(기본 OFF)
+    # article (optional)
     try:
         ctx["downloads"]["article"] = download_article_images(ctx)
     except Exception:
         _write_text(OUT_DIR / "article_images_error.txt", traceback.format_exc())
         ctx["downloads"]["article"] = {"ok": False, "error": "article_images_failed"}
+
+    # ✅ 최종 8장 고정 생성
+    ctx["images_fixed"] = ensure_fixed_8_images(ctx)
 
 
 def node_save_files(ctx: dict[str, Any]) -> None:
@@ -683,6 +846,7 @@ def node_save_files(ctx: dict[str, Any]) -> None:
     src = ctx["inputs"]
     shorts = ctx["shorts"]
     downloads = ctx.get("downloads", {})
+    fixed = ctx.get("images_fixed", {})
 
     script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
     meta_path = OUT_DIR / f"meta_{stamp}_{run_id}.json"
@@ -708,12 +872,10 @@ def node_save_files(ctx: dict[str, Any]) -> None:
     txt.append("PEOPLE: " + ", ".join(shorts.get("people", [])))
     txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
 
-    # 다운로드 결과 요약
     txt.append("")
-    ppl_files = ((downloads.get("people") or {}).get("files") or [])
-    art_files = ((downloads.get("article") or {}).get("files") or [])
-    txt.append(f"PEOPLE_IMAGES: {len(ppl_files)} files -> outputs/images/people/")
-    txt.append(f"ARTICLE_IMAGES: {len(art_files)} files -> outputs/images/article/ (DOWNLOAD_ARTICLE_IMAGES={int(DOWNLOAD_ARTICLE_IMAGES)})")
+    txt.append(f"FIXED_IMAGES: {fixed.get('count')} -> outputs/images/final/01.png ~ 08.png")
+    txt.append(f"DOWNLOAD_ARTICLE_IMAGES: {int(DOWNLOAD_ARTICLE_IMAGES)} (기사 이미지도 필요하면 1로)")
+    txt.append(f"DOWNLOAD_PERSON_IMAGES: {int(DOWNLOAD_PERSON_IMAGES)}")
 
     script_path.write_text("\n".join(txt), encoding="utf-8")
 
@@ -723,6 +885,7 @@ def node_save_files(ctx: dict[str, Any]) -> None:
         "inputs": src,
         "shorts": shorts,
         "downloads": downloads,
+        "images_fixed": fixed,
         "files": {"script": str(script_path), "meta": str(meta_path)},
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -732,9 +895,9 @@ def node_save_files(ctx: dict[str, Any]) -> None:
 def node_print(ctx: dict[str, Any]) -> None:
     log("TOPIC: " + ctx["inputs"]["topic"])
     log("PEOPLE: " + ", ".join(ctx["shorts"].get("people", [])))
+    log("FINAL IMAGES: outputs/images/final/01.png ~ 08.png")
     log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
     log("META FILE: " + ctx["outputs"]["meta_path"])
-    log("IMAGES DIR: outputs/images/")
 
 
 def build_flow() -> Flow:
@@ -759,4 +922,3 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
-
