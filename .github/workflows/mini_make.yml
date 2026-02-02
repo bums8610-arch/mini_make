@@ -53,6 +53,10 @@ jobs:
           BURN_ONSCREEN_TEXT: "1"
         run: |
           python mini_make.py
+                - name: Make video from existing images
+        run: |
+          python make_video_from_images.py
+
 
       - name: Upload outputs
         if: always()
