@@ -6,6 +6,7 @@ import json
 import random
 import time
 import traceback
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, quote
 
 from playwright.sync_api import sync_playwright
 
@@ -36,7 +37,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 USE_OPENAI = os.getenv("USE_OPENAI", "1") == "1"
 
-# Wikidata / Commons (프로필/스틸컷 보충용)
+# Wikidata / Commons
 WIKIDATA_SEARCH = (
     "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=ko&limit=1&search="
 )
@@ -82,6 +83,10 @@ def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 3
         return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:2000]}
     except URLError as e:
         return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
+
+
+def _http_json_simple(url: str, timeout: int = 30) -> Any:
+    return _http_json(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=timeout)
 
 
 def _download(url: str, out_path: Path, timeout: int = 60, referer: str | None = None) -> None:
@@ -306,7 +311,6 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
             all_items = list(all_map.values())
             log(f"[네이버] items={len(all_items)}")
-
             _write_json(OUT_DIR / "naver_items_sample.json", all_items[:200])
 
             if not all_items:
@@ -460,7 +464,6 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
         "ranking_page": inputs["ranking_page"],
         "article_context": inputs.get("article_context", {}),
     }
-
     _write_json(OUT_DIR / "openai_script_payload.json", user_payload)
 
     resp = retry(
@@ -489,12 +492,8 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
 
 
 # ===========================
-# 이미지 수집: 기사(OG/본문) + Wikidata(Commons)
+# 이미지 수집: 기사(OG/본문) + Wikidata/Commons + 중복 제거(sha1)
 # ===========================
-def _http_json_simple(url: str, timeout: int = 30) -> Any:
-    return _http_json(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=timeout)
-
-
 def extract_image_urls_from_article(article_url: str) -> list[str]:
     """기사 페이지에서 og:image + 본문 img url 추출"""
     with sync_playwright() as p:
@@ -579,7 +578,7 @@ def extract_image_urls_from_article(article_url: str) -> list[str]:
 
 
 def wikidata_commons_image_urls(name: str) -> list[str]:
-    """Wikidata 검색 → P18(이미지) → Commons FilePath URL 생성"""
+    """Wikidata 검색 → P18(대표 이미지) → Commons FilePath URL"""
     name = _clean_text(name)
     if not name:
         return []
@@ -619,6 +618,68 @@ def wikidata_commons_image_urls(name: str) -> list[str]:
     return out
 
 
+def commons_search_image_urls(name: str, limit: int = 20) -> list[dict[str, Any]]:
+    """
+    Wikimedia Commons에서 파일(namespace=6) 검색으로 이미지 후보 확보.
+    반환: [{url,title,width,height}, ...]
+    """
+    name = _clean_text(name)
+    if not name:
+        return []
+
+    q = (
+        "https://commons.wikimedia.org/w/api.php"
+        "?action=query&format=json&list=search"
+        f"&srnamespace=6&srlimit={min(limit, 50)}"
+        f"&srsearch={quote_plus(name)}"
+    )
+    data = _http_json_simple(q, timeout=25)
+    hits = (data or {}).get("query", {}).get("search", []) if isinstance(data, dict) else []
+    titles = [h.get("title") for h in hits if isinstance(h, dict) and isinstance(h.get("title"), str)]
+    titles = [t for t in titles if t.startswith("File:")]
+
+    if not titles:
+        return []
+
+    out: list[dict[str, Any]] = []
+    B = 20
+    for i in range(0, len(titles), B):
+        batch = titles[i : i + B]
+        # '|'는 API에서 타이틀 구분자로 쓰이므로 safe 처리
+        titles_param = quote("|".join(batch), safe="|")
+        tq = (
+            "https://commons.wikimedia.org/w/api.php"
+            "?action=query&format=json"
+            f"&prop=imageinfo&iiprop=url|size"
+            f"&titles={titles_param}"
+        )
+        td = _http_json_simple(tq, timeout=25)
+        pages = (td or {}).get("query", {}).get("pages", {}) if isinstance(td, dict) else {}
+        for _, page in (pages or {}).items():
+            if not isinstance(page, dict):
+                continue
+            title = page.get("title")
+            ii = (page.get("imageinfo") or [])
+            if not ii:
+                continue
+            info = ii[0] if isinstance(ii[0], dict) else {}
+            url = info.get("url")
+            w = info.get("width")
+            h = info.get("height")
+            if isinstance(url, str) and url.startswith("http"):
+                out.append({"url": url, "title": title, "width": w, "height": h})
+
+    seen = set()
+    uniq = []
+    for x in out:
+        u = x.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(x)
+    return uniq
+
+
 def extract_names_fallback(topic: str) -> list[str]:
     """OpenAI 없을 때: 제목에서 고유명사 추정(완벽하지 않음)"""
     t = _clean_text(topic)
@@ -645,7 +706,7 @@ def extract_names_fallback(topic: str) -> list[str]:
 
 
 def extract_names_openai(topic: str, article_context: dict[str, Any]) -> list[str]:
-    """가능하면 OpenAI로 제목/요약에서 '당사자 이름' 1~3개만 추출"""
+    """가능하면 OpenAI로 제목/요약에서 '당사자(인물/그룹) 이름' 1~3개만 추출"""
     from openai import OpenAI
 
     client = OpenAI()
@@ -695,6 +756,97 @@ def extract_names_openai(topic: str, article_context: dict[str, Any]) -> list[st
     return out[:3] if out else []
 
 
+def _file_sha1(path: Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_unique_images(
+    *,
+    candidates: list[dict[str, Any]],
+    source_url: str,
+    want: int = 6,
+    max_attempts: int = 80,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    후보를 순회하며 다운로드 → sha1로 중복 제거 → want장 확보.
+    """
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
+
+    results: list[dict[str, Any]] = []
+    files: list[str] = []
+    seen_sha1: set[str] = set()
+
+    # 후보 섞기(중복 체감 감소)
+    random.shuffle(candidates)
+
+    attempts = 0
+    beat = 1
+
+    for c in candidates:
+        if beat > want:
+            break
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+
+        url = c.get("url")
+        provider = c.get("provider", "web")
+        if not isinstance(url, str) or not url:
+            continue
+
+        tmp = IMG_DIR / f"tmp_{stamp}_{run_id}_{attempts}.bin"
+        ref = source_url if provider == "naver_article" else None
+
+        try:
+            _download(url, tmp, timeout=60, referer=ref)
+
+            # 너무 작은 파일(아이콘/픽셀) 제거
+            if tmp.stat().st_size < 30 * 1024:
+                tmp.unlink(missing_ok=True)
+                continue
+
+            sha1 = _file_sha1(tmp)
+            if sha1 in seen_sha1:
+                tmp.unlink(missing_ok=True)
+                continue
+            seen_sha1.add(sha1)
+
+            out_path = IMG_DIR / f"{stamp}_{run_id}_beat{beat:02d}_{provider}_{sha1[:10]}.jpg"
+            tmp.replace(out_path)
+
+            rec = {
+                "beat": beat,
+                "ok": True,
+                "provider": provider,
+                "file": str(out_path),
+                "url": url,
+                "sha1": sha1,
+            }
+            results.append(rec)
+            files.append(str(out_path))
+            beat += 1
+
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            results.append(
+                {
+                    "beat": beat,
+                    "ok": False,
+                    "provider": provider,
+                    "file": str(tmp),
+                    "url": url,
+                    "error": str(e),
+                }
+            )
+
+    return results, files
+
+
 def collect_images_from_web(ctx: dict[str, Any]) -> dict[str, Any]:
     topic = ctx["inputs"]["topic"]
     source_url = ctx["inputs"]["source_url"]
@@ -705,86 +857,73 @@ def collect_images_from_web(ctx: dict[str, Any]) -> dict[str, Any]:
     # 1) 기사에서 이미지 URL 최대 확보
     try:
         urls = extract_image_urls_from_article(source_url)
-        _write_json(OUT_DIR / "article_image_urls.json", {"source_url": source_url, "urls": urls[:200]})
+        _write_json(OUT_DIR / "article_image_urls.json", {"source_url": source_url, "urls": urls[:300]})
         for u in urls:
             candidates.append({"provider": "naver_article", "url": u})
     except Exception:
         _write_text(OUT_DIR / "article_images_error.txt", traceback.format_exc())
 
-    # 2) 부족하면 Wikidata/Commons에서 당사자 이미지 보충
-    if len(candidates) < 6:
-        names: list[str] = []
-        if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
-            try:
-                names = extract_names_openai(topic, article_context)
-                _write_json(OUT_DIR / "wikidata_names.json", {"source": "openai", "names": names})
-            except Exception:
-                _write_text(OUT_DIR / "wikidata_names_error.txt", traceback.format_exc())
-                names = []
+    # 2) Wikidata/Commons 후보 보충 (P18 + 파일검색)
+    names: list[str] = []
+    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
+        try:
+            names = extract_names_openai(topic, article_context)
+            _write_json(OUT_DIR / "wikidata_names.json", {"source": "openai", "names": names})
+        except Exception:
+            _write_text(OUT_DIR / "wikidata_names_error.txt", traceback.format_exc())
+            names = []
 
-        if not names:
-            names = extract_names_fallback(topic)
-            _write_json(OUT_DIR / "wikidata_names.json", {"source": "fallback", "names": names})
+    if not names:
+        names = extract_names_fallback(topic)
+        _write_json(OUT_DIR / "wikidata_names.json", {"source": "fallback", "names": names})
 
-        commons_urls: list[str] = []
-        for n in names:
-            commons_urls.extend(wikidata_commons_image_urls(n))
+    commons_p18: list[str] = []
+    commons_search_hits: list[dict[str, Any]] = []
 
-        _write_json(OUT_DIR / "commons_image_urls.json", {"names": names, "urls": commons_urls})
+    for n in names:
+        commons_p18.extend(wikidata_commons_image_urls(n))
+        commons_search_hits.extend(commons_search_image_urls(n, limit=25))
 
-        for u in commons_urls:
-            candidates.append({"provider": "wikidata_commons", "url": u})
+    _write_json(OUT_DIR / "commons_p18_urls.json", {"names": names, "urls": commons_p18})
+    _write_json(OUT_DIR / "commons_search_urls.json", {"names": names, "hits": commons_search_hits[:250]})
 
-    # 3) 유니크 URL
-    seen = set()
-    uniq: list[dict[str, Any]] = []
+    for u in commons_p18:
+        candidates.append({"provider": "wikidata_commons_p18", "url": u})
+    for x in commons_search_hits:
+        u = x.get("url")
+        if isinstance(u, str) and u:
+            candidates.append({"provider": "wikidata_commons_search", "url": u})
+
+    # 3) URL 유니크(1차)
+    seen_url = set()
+    uniq_candidates: list[dict[str, Any]] = []
     for c in candidates:
         u = c.get("url")
-        if not u or u in seen:
+        if not isinstance(u, str) or not u:
             continue
-        seen.add(u)
-        uniq.append(c)
+        if u in seen_url:
+            continue
+        seen_url.add(u)
+        uniq_candidates.append(c)
 
-    if not uniq:
-        raise RuntimeError(
-            "이미지 후보를 찾지 못했습니다. outputs/article_image_urls.json / outputs/commons_image_urls.json 확인"
-        )
+    if not uniq_candidates:
+        raise RuntimeError("이미지 후보를 찾지 못했습니다. outputs/article_image_urls.json / outputs/commons_* 확인")
 
-    # 4) 6장 다운로드 (부족하면 반복 채움)
-    results: list[dict[str, Any]] = []
-    files: list[str] = []
+    # 4) 다운로드 sha1 유니크(2차)
+    results, files = download_unique_images(
+        candidates=uniq_candidates,
+        source_url=source_url,
+        want=6,
+        max_attempts=120,
+    )
 
-    run_id = os.getenv("GITHUB_RUN_ID", "local")
-    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
-
-    for i in range(6):
-        pick = uniq[i] if i < len(uniq) else uniq[i % len(uniq)]
-        url = pick["url"]
-        provider = pick["provider"]
-
-        out_path = IMG_DIR / f"{stamp}_{run_id}_beat{i+1:02d}_{provider}.jpg"
-        log(f"[WEBIMG] beat{i+1} provider={provider} url={url}")
-
-        try:
-            ref = source_url if provider == "naver_article" else None
-            _download(url, out_path, timeout=60, referer=ref)
-            rec = {"beat": i + 1, "ok": True, "provider": provider, "file": str(out_path), "url": url}
-        except Exception as e:
-            rec = {
-                "beat": i + 1,
-                "ok": False,
-                "provider": provider,
-                "file": str(out_path),
-                "url": url,
-                "error": str(e),
-            }
-
-        results.append(rec)
-        if rec["ok"]:
-            files.append(str(out_path))
-
-    manifest = {"topic": topic, "provider": "web", "images": results, "files": files}
+    ok = sum(1 for r in results if r.get("ok"))
+    manifest = {"topic": topic, "provider": "web", "unique_ok": ok, "images": results, "files": files}
     _write_json(OUT_DIR / "images_manifest.json", manifest)
+
+    if ok < 6:
+        _write_text(OUT_DIR / "images_warning.txt", f"unique_images={ok}/6 (sha1 dedupe enabled)")
+
     return manifest
 
 
@@ -859,6 +998,8 @@ def node_save_files(ctx: dict[str, Any]):
         lines.append("")
         lines.append(f"IMAGES: {ok}/6 -> outputs/images/")
         lines.append("IMAGES_MANIFEST: outputs/images_manifest.json")
+        if ok < 6:
+            lines.append("WARNING: outputs/images_warning.txt 확인(중복 제거로 부족)")
 
     _write_text(script_path, "\n".join(lines))
 
@@ -910,3 +1051,5 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
+
+
