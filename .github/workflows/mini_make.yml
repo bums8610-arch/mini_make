@@ -23,8 +23,9 @@ jobs:
       OPENAI_MAX_OUTPUT_TOKENS: "900"
       USE_OPENAI: "1"
 
-      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      PEXELS_PER_PAGE: "25"
+      FIXED_IMAGE_COUNT: "8"
+      DOWNLOAD_ARTICLE_IMAGES: "1"
+
 
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
