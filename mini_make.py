@@ -14,7 +14,8 @@ from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 
 # =========================
 # 기본 설정
@@ -295,6 +296,16 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 # 2) 기사 컨텍스트(OG + 본문 일부 + og:image)
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
+    def meta_content(page, selector: str) -> str:
+        # locator처럼 '나올 때까지 기다리지 않음' (없으면 바로 "")
+        try:
+            el = page.query_selector(selector)
+            if not el:
+                return ""
+            return el.get_attribute("content") or ""
+        except Exception:
+            return ""
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -304,20 +315,25 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
         page = context.new_page()
         try:
             page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(800)
 
-            og_title = page.locator('meta[property="og:title"]').get_attribute("content") or ""
-            og_description = page.locator('meta[property="og:description"]').get_attribute("content") or ""
-            og_image = page.locator('meta[property="og:image"]').get_attribute("content") or ""
-            published_time = page.locator('meta[property="article:published_time"]').get_attribute("content") or ""
+            og_title = meta_content(page, 'meta[property="og:title"]')
+            og_description = meta_content(page, 'meta[property="og:description"]')
+            og_image = meta_content(page, 'meta[property="og:image"]')
+            published_time = meta_content(page, 'meta[property="article:published_time"]')
 
             body_text = ""
             for sel in ("article", "main", "div#content", "div.article_body", "div#newsct_article", "div#dic_area"):
-                loc = page.locator(sel)
-                if loc.count() > 0:
-                    body_text = loc.first.inner_text() or ""
-                    if len(body_text.strip()) > 200:
-                        break
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        body_text = loc.first.inner_text() or ""
+                        if len(body_text.strip()) > 200:
+                            break
+                except PlaywrightTimeoutError:
+                    continue
+                except Exception:
+                    continue
 
             body_excerpt = _clean_text(body_text)[:1800]
 
@@ -622,14 +638,20 @@ def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
 # ===========================
 def node_load_inputs(ctx: dict[str, Any]) -> None:
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
-    article_ctx = fetch_article_context(article_url)
+
+    try:
+        article_ctx = fetch_article_context(article_url)
+    except Exception as e:
+        # 기사 컨텍스트 수집이 실패해도, 대본 생성은 계속 진행
+        _write_text(OUT_DIR / "article_context_error.txt", traceback.format_exc())
+        article_ctx = {"error": str(e), "final_url": article_url}
+
     ctx["inputs"] = {
         "topic": title,
         "source_url": article_url,
         "ranking_page": ranking_url,
         "article_context": article_ctx,
     }
-
 
 def node_make_script(ctx: dict[str, Any]) -> None:
     ctx["shorts"] = build_60s_shorts_script_openai(ctx["inputs"])
@@ -737,3 +759,4 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
+
