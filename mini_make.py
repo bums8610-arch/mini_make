@@ -1,47 +1,47 @@
-# mini_make.py
 from __future__ import annotations
 
-import os
 import json
+import os
 import random
-import time
+import re
 import traceback
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any, Callable
-from urllib.request import Request, urlopen
+from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, quote
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
 
-
-# ===========================
-# 설정
-# ===========================
+# =========================
+# 기본 설정
+# =========================
 OUT_DIR = Path("outputs")
 IMG_DIR = OUT_DIR / "images"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-IMG_DIR.mkdir(parents=True, exist_ok=True)
+PEOPLE_DIR = IMG_DIR / "people"
+ARTICLE_DIR = IMG_DIR / "article"
+for d in (OUT_DIR, IMG_DIR, PEOPLE_DIR, ARTICLE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-RANKING_URL = "https://m.entertain.naver.com/ranking"
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+RANKING_URL = os.getenv("RANKING_URL", "https://m.entertain.naver.com/ranking").strip()
+
+UA = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 )
 
+# OpenAI
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
-USE_OPENAI = os.getenv("USE_OPENAI", "1") == "1"
 
-# Wikidata / Commons
-WIKIDATA_SEARCH = (
-    "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=ko&limit=1&search="
-)
-WIKIDATA_ENTITY = "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&props=claims&ids="
+# 이미지 수집 옵션
+DOWNLOAD_PERSON_IMAGES = os.getenv("DOWNLOAD_PERSON_IMAGES", "1").strip() == "1"
+DOWNLOAD_ARTICLE_IMAGES = os.getenv("DOWNLOAD_ARTICLE_IMAGES", "0").strip() == "1"
+MAX_PEOPLE = int(os.getenv("MAX_PEOPLE", "5"))
+MAX_ARTICLE_IMAGES = int(os.getenv("MAX_ARTICLE_IMAGES", "8"))
 
 
 def log(msg: str) -> None:
@@ -55,7 +55,16 @@ def now_kst() -> datetime:
 def _clean_text(s: Any) -> str:
     if not isinstance(s, str):
         return ""
-    return " ".join(s.replace("\u00a0", " ").split()).strip()
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _safe_filename(name: str, max_len: int = 80) -> str:
+    name = _clean_text(name)
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", "_", name).strip("_")
+    return (name[:max_len] or "file").strip("_")
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -68,11 +77,25 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
+def _http_get_bytes(url: str, headers: Optional[dict[str, str]] = None, timeout: int = 60) -> bytes:
     req = Request(url, headers=headers or {})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _download(url: str, dst: Path, timeout: int = 60) -> bool:
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+        data = _http_get_bytes(url, headers={"User-Agent": UA, "Accept": "*/*"}, timeout=timeout)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        return True
+    except Exception:
+        return False
+
+
+def _http_json(url: str, headers: Optional[dict[str, str]] = None, timeout: int = 30) -> Any:
+    try:
+        raw = _http_get_bytes(url, headers=headers, timeout=timeout)
         return json.loads(raw.decode("utf-8"))
     except HTTPError as e:
         body = ""
@@ -80,51 +103,11 @@ def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 3
             body = e.read().decode("utf-8", "replace")
         except Exception:
             body = ""
-        return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:2000]}
+        return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:3000]}
     except URLError as e:
         return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
-
-
-def _http_json_simple(url: str, timeout: int = 30) -> Any:
-    return _http_json(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=timeout)
-
-
-def _download(url: str, out_path: Path, timeout: int = 60, referer: str | None = None) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    headers = {
-        "User-Agent": UA,
-        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
-    }
-    if referer:
-        headers["Referer"] = referer
-
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-        out_path.write_bytes(data)
-    except HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        raise RuntimeError(f"download_failed status={getattr(e,'code',0)} url={url} body={body[:200]}") from e
-    except URLError as e:
-        raise RuntimeError(f"download_failed url={url} err={e}") from e
-
-
-def retry(fn: Callable[[], Any], tries: int = 3, base_sleep: float = 1.2) -> Any:
-    last: Exception | None = None
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(base_sleep * (2**i) + random.random() * 0.2)
-    if last:
-        raise last
-    raise RuntimeError("retry_failed")
+    except Exception as e:
+        return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
 
 
 # ===========================
@@ -141,15 +124,15 @@ class Flow:
         self.nodes: dict[str, Node] = {}
         self.links: dict[str, str] = {}
 
-    def add(self, node: Node):
+    def add(self, node: Node) -> None:
         self.nodes[node.name] = node
 
-    def connect(self, a: str, b: str):
+    def connect(self, a: str, b: str) -> None:
         self.links[a] = b
 
-    def run(self, start: str):
+    def run(self, start: str) -> dict[str, Any]:
         ctx: dict[str, Any] = {}
-        cur = start
+        cur: str | None = start
         while cur is not None:
             log(f"[실행] {cur}")
             nxt = self.nodes[cur].fn(ctx)
@@ -158,9 +141,9 @@ class Flow:
 
 
 # ===========================
-# 네이버 랭킹에서 기사 랜덤 선택
+# 1) 네이버 연예 랭킹: 랜덤 기사 선택
 # ===========================
-def _walk_json(obj):
+def _walk_json(obj: Any):
     if isinstance(obj, dict):
         yield obj
         for v in obj.values():
@@ -170,13 +153,7 @@ def _walk_json(obj):
             yield from _walk_json(v)
 
 
-def _is_article_url(url: str) -> bool:
-    if "entertain.naver.com" not in url:
-        return False
-    return ("/article/" in url) or ("/home/article/" in url)
-
-
-def _extract_items_from_json(obj) -> list[dict[str, str]]:
+def _extract_items_from_json(obj: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for node in _walk_json(obj):
         if not isinstance(node, dict):
@@ -204,61 +181,48 @@ def _extract_items_from_json(obj) -> list[dict[str, str]]:
             if oid and aid:
                 url = f"https://m.entertain.naver.com/home/article/{oid}/{aid}"
 
-        if title and url and _is_article_url(url):
+        if title and url and "entertain.naver.com" in url:
             out.append({"title": title, "url": url})
 
-    uniq = {}
+    uniq: dict[str, dict[str, str]] = {}
     for it in out:
         uniq[it["title"] + "|" + it["url"]] = it
     return list(uniq.values())
 
 
 def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
-    json_items: list[dict[str, str]] = []
-    json_urls: list[str] = []
-
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            viewport={"width": 1280, "height": 720},
-            user_agent=UA,
-            extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"},
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        context = browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 420, "height": 900})
         page = context.new_page()
 
-        MAX_JSON = 60
+        json_items: list[dict[str, str]] = []
+        json_urls: list[str] = []
 
         def on_response(resp):
             try:
-                if len(json_urls) >= MAX_JSON:
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
                     return
-                ct = (resp.headers.get("content-type") or "").lower()
-                if "application/json" not in ct:
+                url = resp.url
+                if "ranking" not in url and "entertain" not in url:
                     return
-                u = resp.url
-                if not any(k in u for k in ("ranking", "graphql", "api")):
-                    return
-
-                json_urls.append(u)
-                try:
-                    data = resp.json()
-                    json_items.extend(_extract_items_from_json(data))
-                except Exception:
-                    pass
+                data = resp.json()
+                items = _extract_items_from_json(data)
+                if items:
+                    json_items.extend(items)
+                    json_urls.append(url)
             except Exception:
-                pass
+                return
 
         page.on("response", on_response)
 
         try:
             log(f"[네이버] goto {RANKING_URL}")
-            retry(lambda: page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000), tries=3, base_sleep=1.5)
+            page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
 
             for _ in range(3):
@@ -271,12 +235,13 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                     const links = Array.from(document.querySelectorAll('a'));
                     for (const a of links) {
                       const rawHref = a.getAttribute('href') || '';
-                      const href = rawHref ? new URL(rawHref, location.origin).href : '';
+                      if (!rawHref) continue;
+                      const href = new URL(rawHref, location.origin).href;
                       const text = ((a.innerText || a.textContent || '')).trim().replace(/\\s+/g,' ');
                       if (!href || !text) continue;
 
                       const okDomain = href.includes('entertain.naver.com');
-                      const okPath = href.includes('/article/') || href.includes('/home/article/');
+                      const okPath = href.includes('/article/') || href.includes('/home/article/') || href.includes('/ranking/read');
                       if (okDomain && okPath && text.length >= 6 && text.length <= 120) {
                         out.push({title: text, url: href});
                       }
@@ -287,21 +252,21 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
                 }"""
             ) or []
 
+            next_items: list[dict[str, str]] = []
             next_data_text = page.evaluate(
                 """() => {
                     const el = document.querySelector('#__NEXT_DATA__');
                     return el ? el.textContent : '';
                 }"""
             )
-            next_items: list[dict[str, str]] = []
-            if next_data_text and isinstance(next_data_text, str) and len(next_data_text) > 50:
+            if isinstance(next_data_text, str) and len(next_data_text) > 50:
                 try:
                     next_json = json.loads(next_data_text)
                     next_items = _extract_items_from_json(next_json)
                 except Exception:
                     next_items = []
 
-            all_map = {}
+            all_map: dict[str, dict[str, str]] = {}
             for it in (json_items or []):
                 all_map[it["title"] + "|" + it["url"]] = it
             for it in (next_items or []):
@@ -311,12 +276,11 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
             all_items = list(all_map.values())
             log(f"[네이버] items={len(all_items)}")
-            _write_json(OUT_DIR / "naver_items_sample.json", all_items[:200])
 
             if not all_items:
                 _write_text(OUT_DIR / "naver_debug.html", page.content())
                 page.screenshot(path=str(OUT_DIR / "naver_debug.png"), full_page=True)
-                _write_text(OUT_DIR / "naver_json_urls.txt", "\n".join(json_urls[:500]))
+                _write_text(OUT_DIR / "naver_json_urls.txt", "\n".join(json_urls[:200]))
                 raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
 
             chosen = random.choice(all_items)
@@ -328,7 +292,7 @@ def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
 
 
 # ===========================
-# 기사 컨텍스트(OG + 본문 일부)
+# 2) 기사 컨텍스트(OG + 본문 일부 + og:image)
 # ===========================
 def fetch_article_context(article_url: str) -> dict[str, Any]:
     with sync_playwright() as p:
@@ -336,53 +300,34 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            viewport={"width": 1280, "height": 720},
-            user_agent=UA,
-            extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"},
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        context = browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 420, "height": 900})
         page = context.new_page()
-
         try:
-            retry(lambda: page.goto(article_url, wait_until="domcontentloaded", timeout=60000), tries=3, base_sleep=1.5)
+            page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
 
-            data = page.evaluate(
-                """() => {
-                    function metaBy(sel) {
-                      const el = document.querySelector(sel);
-                      return el ? (el.getAttribute('content') || '') : '';
-                    }
-                    function pickBody() {
-                      const selectors = ['#articleBodyContents','div#dic_area','div._article_content','div.article_body','article','main'];
-                      let best = '';
-                      for (const sel of selectors) {
-                        const el = document.querySelector(sel);
-                        if (!el) continue;
-                        const t = (el.innerText || '').trim();
-                        if (t.length > best.length) best = t;
-                      }
-                      if (!best) best = (document.body && document.body.innerText) ? document.body.innerText : '';
-                      return best;
-                    }
+            og_title = page.locator('meta[property="og:title"]').get_attribute("content") or ""
+            og_description = page.locator('meta[property="og:description"]').get_attribute("content") or ""
+            og_image = page.locator('meta[property="og:image"]').get_attribute("content") or ""
+            published_time = page.locator('meta[property="article:published_time"]').get_attribute("content") or ""
 
-                    const og_title = metaBy('meta[property="og:title"]');
-                    const og_description = metaBy('meta[property="og:description"]');
-                    const published = metaBy('meta[property="article:published_time"]') || metaBy('meta[name="article:published_time"]');
-                    const body = pickBody();
-                    return { og_title, og_description, published_time: published, body_text: body };
-                }"""
-            )
+            body_text = ""
+            for sel in ("article", "main", "div#content", "div.article_body", "div#newsct_article", "div#dic_area"):
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    body_text = loc.first.inner_text() or ""
+                    if len(body_text.strip()) > 200:
+                        break
+
+            body_excerpt = _clean_text(body_text)[:1800]
 
             return {
+                "og_title": _clean_text(og_title),
+                "og_description": _clean_text(og_description),
+                "og_image": _clean_text(og_image),
+                "published_time": _clean_text(published_time),
+                "body_excerpt": body_excerpt,
                 "final_url": page.url,
-                "og_title": _clean_text(data.get("og_title", ""))[:200],
-                "og_description": _clean_text(data.get("og_description", ""))[:300],
-                "published_time": _clean_text(data.get("published_time", ""))[:60],
-                "body_snippet": _clean_text(data.get("body_text", ""))[:1200],
             }
         finally:
             context.close()
@@ -390,38 +335,33 @@ def fetch_article_context(article_url: str) -> dict[str, Any]:
 
 
 # ===========================
-# 대본 생성: 템플릿(폴백)
+# 3) OpenAI로 대본 생성(항상 OpenAI만)
 # ===========================
-def build_60s_shorts_script_template(inputs: dict[str, Any]) -> dict[str, Any]:
-    topic = inputs["topic"]
-    beats = [
-        {"t": "0-2s", "voice": f"오늘 연예 랭킹 한 줄 요약! {topic}", "onscreen": "오늘 랭킹", "broll": "ranking scroll"},
-        {"t": "2-10s", "voice": "왜 뜨는지 제목/요약 기준으로 핵심만 볼게요.", "onscreen": "왜 뜸?", "broll": "news keywords"},
-        {"t": "10-25s", "voice": "포인트 1. 사람들이 멈춰보는 키워드가 있어요.", "onscreen": "포인트1", "broll": "headline highlight"},
-        {"t": "25-40s", "voice": "포인트 2. 댓글·공유가 생길 포인트가 보여요.", "onscreen": "포인트2", "broll": "social comments"},
-        {"t": "40-55s", "voice": "포인트 3. 다음 이슈로 이어질 흐름이 보입니다.", "onscreen": "포인트3", "broll": "news collage"},
-        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 정리할게요. 구독!", "onscreen": "구독!", "broll": "subscribe"},
+def _require_openai_key() -> None:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY가 없습니다. GitHub Secrets에 OPENAI_API_KEY를 추가하세요.")
+
+
+def _pick_style() -> str:
+    styles = [
+        "차분하고 사실 중심",
+        "속도감 있게 핵심만",
+        "댓글 반응 포인트 중심",
+        "팩트-추정 구분을 강조",
+        "연예뉴스 아나운서 톤",
     ]
-    return {
-        "_generator": "template",
-        "topic": topic,
-        "title_short": topic[:28],
-        "description": "네이버 연예 랭킹 기반 요약(제목/요약 기준)",
-        "beats": beats,
-        "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"],
-        "notes": "정보가 부족한 부분은 '제목/요약 기준'으로 표현",
-    }
+    return random.choice(styles)
 
 
-# ===========================
-# 대본 생성: OpenAI(구조화 JSON) + 폴백
-# ===========================
 def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
+    _require_openai_key()
     from openai import OpenAI
 
     client = OpenAI()
+    style = _pick_style()
 
-    schema = {
+    # people: 인물명 배열(0~MAX_PEOPLE) — 없으면 빈 배열
+    schema: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
@@ -439,617 +379,361 @@ def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
                         "t": {"type": "string"},
                         "voice": {"type": "string"},
                         "onscreen": {"type": "string"},
-                        "broll": {"type": "string"},
                     },
-                    "required": ["t", "voice", "onscreen", "broll"],
+                    "required": ["t", "voice", "onscreen"],
                 },
             },
-            "hashtags": {"type": "array", "items": {"type": "string"}, "minItems": 4, "maxItems": 10},
+            "people": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": MAX_PEOPLE,
+                "items": {"type": "string"},
+            },
+            "hashtags": {"type": "array", "minItems": 4, "maxItems": 10, "items": {"type": "string"}},
             "notes": {"type": "string"},
         },
-        "required": ["topic", "title_short", "description", "beats", "hashtags", "notes"],
+        "required": ["topic", "title_short", "description", "beats", "people", "hashtags", "notes"],
     }
 
+    time_slots = ["0-2s", "2-10s", "10-25s", "25-40s", "40-55s", "55-60s"]
+
     system = (
-        "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다. "
-        "입력(제목/OG설명/본문발췌/링크) 밖의 사실을 단정하지 말고, 불확실하면 '제목/요약 기준'이라고 표현해라. "
-        "과장/루머/비방 금지. "
-        "정확히 6구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s). "
-        "onscreen은 12자 이내, voice는 짧고 말로 읽기 좋게."
+        "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다.\n"
+        "입력(JSON)에는 기사 제목/OG설명/본문 발췌가 있을 수 있다.\n"
+        "- 입력에 없는 사실을 단정하지 말고, 불확실하면 '기사 제목/발췌 기준'이라고 표현.\n"
+        "- 과장/루머/비방/명예훼손/개인정보 추정 금지.\n"
+        "- 정확히 6구간으로 작성: 0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s.\n"
+        "- onscreen: 12자 이내(한국어), voice: 한 구간당 1~2문장.\n"
+        f"- 전체 톤/스타일: {style}\n"
+        "- people: 기사 제목/발췌에 등장하는 실명 인물만 추려서 배열로 출력. 없으면 [].\n"
+        "출력은 반드시 JSON(schema strict)만."
     )
 
-    user_payload = {
+    payload = {
         "topic": inputs["topic"],
         "source_url": inputs["source_url"],
         "ranking_page": inputs["ranking_page"],
         "article_context": inputs.get("article_context", {}),
     }
-    _write_json(OUT_DIR / "openai_script_payload.json", user_payload)
 
-    resp = retry(
-        lambda: client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            text={"format": {"type": "json_schema", "name": "shorts_script", "strict": True, "schema": schema}},
-            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-        ),
-        tries=3,
-        base_sleep=1.5,
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        text={"format": {"type": "json_schema", "name": "shorts_script", "strict": True, "schema": schema}},
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
     )
 
     data = json.loads(resp.output_text)
-    data["_generator"] = f"openai:{OPENAI_MODEL}"
 
-    for b in data.get("beats", []):
-        b["t"] = _clean_text(b.get("t", ""))[:20]
-        b["voice"] = _clean_text(b.get("voice", ""))[:220]
+    beats = data.get("beats") if isinstance(data.get("beats"), list) else []
+    if len(beats) != 6:
+        raise RuntimeError("OpenAI 응답 beats 형식이 올바르지 않습니다(6개 필수).")
+
+    for i, b in enumerate(beats):
+        b["t"] = time_slots[i]
+        b["voice"] = _clean_text(b.get("voice", ""))[:240]
         b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
-        b["broll"] = _clean_text(b.get("broll", ""))[:80]
+
+    # people 정리(중복 제거)
+    ppl = data.get("people")
+    if not isinstance(ppl, list):
+        ppl = []
+    norm = []
+    seen = set()
+    for x in ppl:
+        name = _clean_text(x)
+        if not name or len(name) > 40:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        norm.append(name)
+    data["people"] = norm[:MAX_PEOPLE]
+
+    data["_generator"] = f"openai:{OPENAI_MODEL}"
+    data["_style"] = style
     return data
 
 
 # ===========================
-# 이미지 수집: 기사(OG/본문) + Wikidata/Commons + 중복 제거(sha1)
+# 4) 인물 이미지 다운로드 (Wikipedia ko/en 대표 이미지)
 # ===========================
-def extract_image_urls_from_article(article_url: str) -> list[str]:
-    """기사 페이지에서 og:image + 본문 img url 추출"""
+def _wiki_page_image(person_name: str, lang: str = "ko") -> dict[str, Any]:
+    # pageimages로 대표 이미지(original) 가져오기
+    title = quote_plus(person_name)
+    url = (
+        f"https://{lang}.wikipedia.org/w/api.php"
+        f"?action=query&format=json&prop=pageimages&piprop=original&redirects=1&titles={title}"
+    )
+    data = _http_json(url, headers={"User-Agent": UA}, timeout=20)
+    if isinstance(data, dict) and data.get("_error"):
+        return {"ok": False, "lang": lang, "error": data}
+
+    pages = (((data or {}).get("query") or {}).get("pages") or {})
+    if not isinstance(pages, dict) or not pages:
+        return {"ok": False, "lang": lang, "error": "no_pages"}
+
+    # pages는 키가 pageid인 dict
+    for _, p in pages.items():
+        if not isinstance(p, dict):
+            continue
+        original = p.get("original") or {}
+        src = original.get("source")
+        if isinstance(src, str) and src.startswith("http"):
+            return {"ok": True, "lang": lang, "page_title": p.get("title"), "image_url": src}
+    return {"ok": False, "lang": lang, "error": "no_image"}
+
+
+def download_people_images(ctx: dict[str, Any]) -> dict[str, Any]:
+    people = (ctx.get("shorts") or {}).get("people") or []
+    if not DOWNLOAD_PERSON_IMAGES:
+        return {"ok": False, "skipped": True, "reason": "DOWNLOAD_PERSON_IMAGES=0"}
+
+    if not isinstance(people, list) or not people:
+        return {"ok": True, "people": [], "files": []}
+
+    results = []
+    files = []
+
+    for name in people:
+        safe = _safe_filename(name)
+        # ko -> en 순서로 시도
+        info = _wiki_page_image(name, "ko")
+        if not info.get("ok"):
+            info = _wiki_page_image(name, "en")
+
+        rec = {"name": name, "source": "wikipedia", **info}
+        if info.get("ok") and isinstance(info.get("image_url"), str):
+            ext = ".jpg"
+            url = info["image_url"]
+            if "." in url.split("?")[0].split("/")[-1]:
+                ext_guess = "." + url.split("?")[0].split("/")[-1].split(".")[-1].lower()
+                if len(ext_guess) <= 5:
+                    ext = ext_guess
+
+            path = PEOPLE_DIR / f"{safe}{ext}"
+            ok = _download(url, path, timeout=60)
+            rec["saved_path"] = str(path) if ok else ""
+            rec["download_ok"] = ok
+            if ok:
+                files.append(str(path))
+        else:
+            rec["download_ok"] = False
+
+        results.append(rec)
+
+    manifest = {"ok": True, "people": results, "files": files}
+    _write_json(OUT_DIR / "people_images_manifest.json", manifest)
+    return manifest
+
+
+# ===========================
+# 5) (옵션) 기사 이미지 다운로드: og:image + img 태그
+# ===========================
+def download_article_images(ctx: dict[str, Any]) -> dict[str, Any]:
+    if not DOWNLOAD_ARTICLE_IMAGES:
+        return {"ok": False, "skipped": True, "reason": "DOWNLOAD_ARTICLE_IMAGES=0"}
+
+    inputs = ctx.get("inputs") or {}
+    url = inputs.get("source_url")
+    if not isinstance(url, str) or not url:
+        return {"ok": False, "error": "no_source_url"}
+
+    images: list[str] = []
+    ac = (inputs.get("article_context") or {})
+    og = ac.get("og_image")
+    if isinstance(og, str) and og.startswith("http"):
+        images.append(og)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            viewport={"width": 1280, "height": 720},
-            user_agent=UA,
-            extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"},
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        context = browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 420, "height": 900})
         page = context.new_page()
         try:
-            retry(lambda: page.goto(article_url, wait_until="domcontentloaded", timeout=60000), tries=3, base_sleep=1.5)
-            page.wait_for_timeout(1200)
-
-            urls = page.evaluate(
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+            img_urls = page.evaluate(
                 """() => {
-                  const out = [];
-                  const push = (u) => {
-                    if (!u) return;
-                    if (u.startsWith('data:')) return;
-                    try { u = new URL(u, location.href).href; } catch(e) { return; }
-                    if (u.includes('sprite') || u.includes('sp_')) return;
-                    out.push(u);
-                  };
-
-                  // OG / Twitter
-                  const metas = [
-                    'meta[property="og:image"]',
-                    'meta[name="twitter:image"]',
-                    'meta[property="twitter:image"]',
-                  ];
-                  for (const sel of metas) {
-                    const el = document.querySelector(sel);
-                    if (el) push(el.getAttribute('content') || '');
-                  }
-
-                  // 본문 후보
-                  const areas = ['#articleBodyContents','div#dic_area','div._article_content','div.article_body','article','main'];
-                  for (const sel of areas) {
-                    const root = document.querySelector(sel);
-                    if (!root) continue;
-                    const imgs = Array.from(root.querySelectorAll('img'));
-                    for (const img of imgs) {
-                      push(img.getAttribute('src') || '');
-                      push(img.getAttribute('data-src') || '');
-                      push(img.getAttribute('data-lazy-src') || '');
-                      push(img.getAttribute('data-original') || '');
+                    const out = [];
+                    const imgs = Array.from(document.querySelectorAll('img'));
+                    for (const im of imgs) {
+                      const src = im.currentSrc || im.src || '';
+                      if (!src) continue;
+                      if (!src.startsWith('http')) continue;
+                      // 너무 작은 로고/아이콘 제외
+                      const w = im.naturalWidth || im.width || 0;
+                      const h = im.naturalHeight || im.height || 0;
+                      if (w && h && (w < 200 || h < 200)) continue;
+                      out.push(src);
                     }
-                  }
-
-                  return Array.from(new Set(out));
+                    // 중복 제거
+                    return Array.from(new Set(out));
                 }"""
             ) or []
-
-            cleaned: list[str] = []
-            for u in urls:
-                u = (u or "").strip()
-                if not u:
-                    continue
-                low = u.lower()
-                if any(x in low for x in (".svg", ".ico", "pixel", "tracker")):
-                    continue
-                cleaned.append(u)
-
-            seen = set()
-            final = []
-            for u in cleaned:
-                if u in seen:
-                    continue
-                seen.add(u)
-                final.append(u)
-            return final
+            if isinstance(img_urls, list):
+                for u in img_urls:
+                    if isinstance(u, str) and u.startswith("http"):
+                        images.append(u)
         finally:
             context.close()
             browser.close()
 
-
-def wikidata_commons_image_urls(name: str) -> list[str]:
-    """Wikidata 검색 → P18(대표 이미지) → Commons FilePath URL"""
-    name = _clean_text(name)
-    if not name:
-        return []
-
-    s = _http_json_simple(WIKIDATA_SEARCH + quote_plus(name), timeout=25)
-    items = (s or {}).get("search", []) if isinstance(s, dict) else []
-    if not items:
-        return []
-
-    qid = (items[0] or {}).get("id")
-    if not qid:
-        return []
-
-    e = _http_json_simple(WIKIDATA_ENTITY + quote_plus(qid), timeout=25)
-    ent = (((e or {}).get("entities") or {}).get(qid) or {}) if isinstance(e, dict) else {}
-    claims = ent.get("claims") or {}
-    p18 = claims.get("P18") or []
-
-    urls: list[str] = []
-    for c in p18[:3]:
-        try:
-            filename = c["mainsnak"]["datavalue"]["value"]
-            if not isinstance(filename, str):
-                continue
-            fp = "https://commons.wikimedia.org/wiki/Special:FilePath/" + quote_plus(filename.replace(" ", "_"))
-            urls.append(fp)
-        except Exception:
-            continue
-
-    seen = set()
-    out = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        out.append(u)
-    return out
-
-
-def commons_search_image_urls(name: str, limit: int = 20) -> list[dict[str, Any]]:
-    """
-    Wikimedia Commons에서 파일(namespace=6) 검색으로 이미지 후보 확보.
-    반환: [{url,title,width,height}, ...]
-    """
-    name = _clean_text(name)
-    if not name:
-        return []
-
-    q = (
-        "https://commons.wikimedia.org/w/api.php"
-        "?action=query&format=json&list=search"
-        f"&srnamespace=6&srlimit={min(limit, 50)}"
-        f"&srsearch={quote_plus(name)}"
-    )
-    data = _http_json_simple(q, timeout=25)
-    hits = (data or {}).get("query", {}).get("search", []) if isinstance(data, dict) else []
-    titles = [h.get("title") for h in hits if isinstance(h, dict) and isinstance(h.get("title"), str)]
-    titles = [t for t in titles if t.startswith("File:")]
-
-    if not titles:
-        return []
-
-    out: list[dict[str, Any]] = []
-    B = 20
-    for i in range(0, len(titles), B):
-        batch = titles[i : i + B]
-        # '|'는 API에서 타이틀 구분자로 쓰이므로 safe 처리
-        titles_param = quote("|".join(batch), safe="|")
-        tq = (
-            "https://commons.wikimedia.org/w/api.php"
-            "?action=query&format=json"
-            f"&prop=imageinfo&iiprop=url|size"
-            f"&titles={titles_param}"
-        )
-        td = _http_json_simple(tq, timeout=25)
-        pages = (td or {}).get("query", {}).get("pages", {}) if isinstance(td, dict) else {}
-        for _, page in (pages or {}).items():
-            if not isinstance(page, dict):
-                continue
-            title = page.get("title")
-            ii = (page.get("imageinfo") or [])
-            if not ii:
-                continue
-            info = ii[0] if isinstance(ii[0], dict) else {}
-            url = info.get("url")
-            w = info.get("width")
-            h = info.get("height")
-            if isinstance(url, str) and url.startswith("http"):
-                out.append({"url": url, "title": title, "width": w, "height": h})
-
-    seen = set()
+    # 정리 + 제한
     uniq = []
-    for x in out:
-        u = x.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append(x)
-    return uniq
-
-
-def extract_names_fallback(topic: str) -> list[str]:
-    """OpenAI 없을 때: 제목에서 고유명사 추정(완벽하지 않음)"""
-    t = _clean_text(topic)
-    if not t:
-        return []
-    t = t[:60]
-    parts = [p.strip() for p in t.replace("“", " ").replace("”", " ").replace("'", " ").split() if p.strip()]
-    cands = []
-    if len(parts) >= 2:
-        cands.append(" ".join(parts[:2]))
-    if len(parts) >= 3:
-        cands.append(" ".join(parts[:3]))
-    if parts:
-        cands.append(parts[0])
-
     seen = set()
-    out = []
-    for c in cands:
-        if c in seen:
+    for u in images:
+        key = u.split("#")[0]
+        if key in seen:
             continue
-        seen.add(c)
-        out.append(c)
-    return out[:3]
+        seen.add(key)
+        uniq.append(u)
 
+    uniq = uniq[:MAX_ARTICLE_IMAGES]
 
-def extract_names_openai(topic: str, article_context: dict[str, Any]) -> list[str]:
-    """가능하면 OpenAI로 제목/요약에서 '당사자(인물/그룹) 이름' 1~3개만 추출"""
-    from openai import OpenAI
+    results = []
+    files = []
+    for i, u in enumerate(uniq, start=1):
+        ext = ".jpg"
+        fname = u.split("?")[0].split("/")[-1]
+        if "." in fname:
+            eg = "." + fname.split(".")[-1].lower()
+            if 2 <= len(eg) <= 5:
+                ext = eg
+        path = ARTICLE_DIR / f"article_{i:02d}{ext}"
+        ok = _download(u, path, timeout=60)
+        results.append({"index": i, "url": u, "saved_path": str(path) if ok else "", "download_ok": ok})
+        if ok:
+            files.append(str(path))
 
-    client = OpenAI()
-
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {"names": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string"}}},
-        "required": ["names"],
-    }
-
-    system = (
-        "너는 기사 제목/요약에서 '당사자(인물/그룹) 이름'만 뽑는다. "
-        "추측 금지. 불명확하면 제목에서 가장 가능성 높은 고유명사 1~2개만 반환. "
-        "반드시 1~3개."
-    )
-    payload = {
-        "topic": topic,
-        "og_title": (article_context or {}).get("og_title", ""),
-        "og_description": (article_context or {}).get("og_description", ""),
-    }
-
-    resp = retry(
-        lambda: client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            text={"format": {"type": "json_schema", "name": "names", "strict": True, "schema": schema}},
-            max_output_tokens=200,
-        ),
-        tries=3,
-        base_sleep=1.5,
-    )
-
-    data = json.loads(resp.output_text)
-    names = [_clean_text(x)[:50] for x in (data.get("names") or []) if _clean_text(x)]
-
-    seen = set()
-    out = []
-    for n in names:
-        if n in seen:
-            continue
-        seen.add(n)
-        out.append(n)
-    return out[:3] if out else []
-
-
-def _file_sha1(path: Path) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def download_unique_images(
-    *,
-    candidates: list[dict[str, Any]],
-    source_url: str,
-    want: int = 6,
-    max_attempts: int = 80,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """
-    후보를 순회하며 다운로드 → sha1로 중복 제거 → want장 확보.
-    """
-    run_id = os.getenv("GITHUB_RUN_ID", "local")
-    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
-
-    results: list[dict[str, Any]] = []
-    files: list[str] = []
-    seen_sha1: set[str] = set()
-
-    # 후보 섞기(중복 체감 감소)
-    random.shuffle(candidates)
-
-    attempts = 0
-    beat = 1
-
-    for c in candidates:
-        if beat > want:
-            break
-        if attempts >= max_attempts:
-            break
-        attempts += 1
-
-        url = c.get("url")
-        provider = c.get("provider", "web")
-        if not isinstance(url, str) or not url:
-            continue
-
-        tmp = IMG_DIR / f"tmp_{stamp}_{run_id}_{attempts}.bin"
-        ref = source_url if provider == "naver_article" else None
-
-        try:
-            _download(url, tmp, timeout=60, referer=ref)
-
-            # 너무 작은 파일(아이콘/픽셀) 제거
-            if tmp.stat().st_size < 30 * 1024:
-                tmp.unlink(missing_ok=True)
-                continue
-
-            sha1 = _file_sha1(tmp)
-            if sha1 in seen_sha1:
-                tmp.unlink(missing_ok=True)
-                continue
-            seen_sha1.add(sha1)
-
-            out_path = IMG_DIR / f"{stamp}_{run_id}_beat{beat:02d}_{provider}_{sha1[:10]}.jpg"
-            tmp.replace(out_path)
-
-            rec = {
-                "beat": beat,
-                "ok": True,
-                "provider": provider,
-                "file": str(out_path),
-                "url": url,
-                "sha1": sha1,
-            }
-            results.append(rec)
-            files.append(str(out_path))
-            beat += 1
-
-        except Exception as e:
-            tmp.unlink(missing_ok=True)
-            results.append(
-                {
-                    "beat": beat,
-                    "ok": False,
-                    "provider": provider,
-                    "file": str(tmp),
-                    "url": url,
-                    "error": str(e),
-                }
-            )
-
-    return results, files
-
-
-def collect_images_from_web(ctx: dict[str, Any]) -> dict[str, Any]:
-    topic = ctx["inputs"]["topic"]
-    source_url = ctx["inputs"]["source_url"]
-    article_context = ctx["inputs"].get("article_context") or {}
-
-    candidates: list[dict[str, Any]] = []
-
-    # 1) 기사에서 이미지 URL 최대 확보
-    try:
-        urls = extract_image_urls_from_article(source_url)
-        _write_json(OUT_DIR / "article_image_urls.json", {"source_url": source_url, "urls": urls[:300]})
-        for u in urls:
-            candidates.append({"provider": "naver_article", "url": u})
-    except Exception:
-        _write_text(OUT_DIR / "article_images_error.txt", traceback.format_exc())
-
-    # 2) Wikidata/Commons 후보 보충 (P18 + 파일검색)
-    names: list[str] = []
-    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
-        try:
-            names = extract_names_openai(topic, article_context)
-            _write_json(OUT_DIR / "wikidata_names.json", {"source": "openai", "names": names})
-        except Exception:
-            _write_text(OUT_DIR / "wikidata_names_error.txt", traceback.format_exc())
-            names = []
-
-    if not names:
-        names = extract_names_fallback(topic)
-        _write_json(OUT_DIR / "wikidata_names.json", {"source": "fallback", "names": names})
-
-    commons_p18: list[str] = []
-    commons_search_hits: list[dict[str, Any]] = []
-
-    for n in names:
-        commons_p18.extend(wikidata_commons_image_urls(n))
-        commons_search_hits.extend(commons_search_image_urls(n, limit=25))
-
-    _write_json(OUT_DIR / "commons_p18_urls.json", {"names": names, "urls": commons_p18})
-    _write_json(OUT_DIR / "commons_search_urls.json", {"names": names, "hits": commons_search_hits[:250]})
-
-    for u in commons_p18:
-        candidates.append({"provider": "wikidata_commons_p18", "url": u})
-    for x in commons_search_hits:
-        u = x.get("url")
-        if isinstance(u, str) and u:
-            candidates.append({"provider": "wikidata_commons_search", "url": u})
-
-    # 3) URL 유니크(1차)
-    seen_url = set()
-    uniq_candidates: list[dict[str, Any]] = []
-    for c in candidates:
-        u = c.get("url")
-        if not isinstance(u, str) or not u:
-            continue
-        if u in seen_url:
-            continue
-        seen_url.add(u)
-        uniq_candidates.append(c)
-
-    if not uniq_candidates:
-        raise RuntimeError("이미지 후보를 찾지 못했습니다. outputs/article_image_urls.json / outputs/commons_* 확인")
-
-    # 4) 다운로드 sha1 유니크(2차)
-    results, files = download_unique_images(
-        candidates=uniq_candidates,
-        source_url=source_url,
-        want=6,
-        max_attempts=120,
-    )
-
-    ok = sum(1 for r in results if r.get("ok"))
-    manifest = {"topic": topic, "provider": "web", "unique_ok": ok, "images": results, "files": files}
-    _write_json(OUT_DIR / "images_manifest.json", manifest)
-
-    if ok < 6:
-        _write_text(OUT_DIR / "images_warning.txt", f"unique_images={ok}/6 (sha1 dedupe enabled)")
-
+    manifest = {"ok": True, "source_url": url, "items": results, "files": files}
+    _write_json(OUT_DIR / "article_images_manifest.json", manifest)
     return manifest
 
 
 # ===========================
-# 노드들
+# Nodes
 # ===========================
-def node_load_inputs(ctx: dict[str, Any]):
+def node_load_inputs(ctx: dict[str, Any]) -> None:
     title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
-    ctx["inputs"] = {"topic": title, "source_url": article_url, "ranking_page": ranking_url}
+    article_ctx = fetch_article_context(article_url)
+    ctx["inputs"] = {
+        "topic": title,
+        "source_url": article_url,
+        "ranking_page": ranking_url,
+        "article_context": article_ctx,
+    }
+
+
+def node_make_script(ctx: dict[str, Any]) -> None:
+    ctx["shorts"] = build_60s_shorts_script_openai(ctx["inputs"])
+    _write_json(OUT_DIR / "shorts.json", ctx["shorts"])
+
+
+def node_download_images(ctx: dict[str, Any]) -> None:
+    ctx["downloads"] = {}
+    # 인물 이미지(기본 ON)
     try:
-        ctx["inputs"]["article_context"] = fetch_article_context(article_url)
-    except Exception as e:
-        ctx["inputs"]["article_context"] = {"error": str(e)}
-    return "MAKE_SCRIPT"
-
-
-def node_make_script(ctx: dict[str, Any]):
-    inputs = ctx["inputs"]
-
-    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
-        try:
-            ctx["shorts"] = build_60s_shorts_script_openai(inputs)
-            return "COLLECT_IMAGES"
-        except Exception:
-            _write_text(OUT_DIR / "openai_error.txt", traceback.format_exc())
-
-    ctx["shorts"] = build_60s_shorts_script_template(inputs)
-    return "COLLECT_IMAGES"
-
-
-def node_collect_images(ctx: dict[str, Any]):
-    try:
-        ctx["images"] = collect_images_from_web(ctx)
+        ctx["downloads"]["people"] = download_people_images(ctx)
     except Exception:
-        _write_text(OUT_DIR / "images_error.txt", traceback.format_exc())
-        ctx["images"] = {"provider": "web", "ok": False, "error": "collect_images_failed"}
-    return "SAVE_FILES"
+        _write_text(OUT_DIR / "people_images_error.txt", traceback.format_exc())
+        ctx["downloads"]["people"] = {"ok": False, "error": "people_images_failed"}
+
+    # 기사 이미지(기본 OFF)
+    try:
+        ctx["downloads"]["article"] = download_article_images(ctx)
+    except Exception:
+        _write_text(OUT_DIR / "article_images_error.txt", traceback.format_exc())
+        ctx["downloads"]["article"] = {"ok": False, "error": "article_images_failed"}
 
 
-def node_save_files(ctx: dict[str, Any]):
+def node_save_files(ctx: dict[str, Any]) -> None:
     kst = now_kst()
     stamp = kst.strftime("%Y%m%d_%H%M")
     run_id = os.getenv("GITHUB_RUN_ID", "local")
 
-    script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
-    meta_path = OUT_DIR / f"shorts_{stamp}_{run_id}.json"
-
     src = ctx["inputs"]
     shorts = ctx["shorts"]
+    downloads = ctx.get("downloads", {})
 
-    lines: list[str] = []
-    lines.append(f"DATE(KST): {kst.isoformat()}")
-    lines.append(f"GENERATOR: {shorts.get('_generator')}")
-    lines.append(f"TOPIC: {shorts.get('topic')}")
-    lines.append(f"SOURCE_URL: {src.get('source_url')}")
-    lines.append(f"RANKING_PAGE: {src.get('ranking_page')}")
+    script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
+    meta_path = OUT_DIR / f"meta_{stamp}_{run_id}.json"
 
-    ac = src.get("article_context") or {}
-    lines.append(f"ARTICLE_OG_TITLE: {ac.get('og_title','')}")
-    lines.append(f"ARTICLE_OG_DESC: {ac.get('og_description','')}")
-    lines.append("")
+    txt: list[str] = []
+    txt.append(f"DATE(KST): {kst.isoformat()}")
+    txt.append(f"GENERATOR: {shorts.get('_generator')}")
+    txt.append(f"STYLE: {shorts.get('_style')}")
+    txt.append(f"TOPIC: {shorts.get('topic')}")
+    txt.append(f"SOURCE_URL: {src['source_url']}")
+    txt.append(f"RANKING_PAGE: {src['ranking_page']}")
+    txt.append("")
+    ac = src.get("article_context", {}) or {}
+    txt.append(f"OG_TITLE: {ac.get('og_title','')}")
+    txt.append(f"OG_DESC: {ac.get('og_description','')}")
+    txt.append(f"OG_IMAGE: {ac.get('og_image','')}")
+    txt.append("")
 
     for b in shorts.get("beats", []):
-        lines.append(f'[{b.get("t")}] {b.get("voice")}')
-        lines.append(f'  - ONSCREEN: {b.get("onscreen")}')
-        lines.append(f'  - BROLL: {b.get("broll")}')
-    lines.append("")
-    lines.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
+        txt.append(f"[{b.get('t')}] {b.get('voice')}")
+        txt.append(f"  - ONSCREEN: {b.get('onscreen')}")
+    txt.append("")
+    txt.append("PEOPLE: " + ", ".join(shorts.get("people", [])))
+    txt.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
 
-    if "images" in ctx and isinstance(ctx["images"], dict):
-        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
-        lines.append("")
-        lines.append(f"IMAGES: {ok}/6 -> outputs/images/")
-        lines.append("IMAGES_MANIFEST: outputs/images_manifest.json")
-        if ok < 6:
-            lines.append("WARNING: outputs/images_warning.txt 확인(중복 제거로 부족)")
+    # 다운로드 결과 요약
+    txt.append("")
+    ppl_files = ((downloads.get("people") or {}).get("files") or [])
+    art_files = ((downloads.get("article") or {}).get("files") or [])
+    txt.append(f"PEOPLE_IMAGES: {len(ppl_files)} files -> outputs/images/people/")
+    txt.append(f"ARTICLE_IMAGES: {len(art_files)} files -> outputs/images/article/ (DOWNLOAD_ARTICLE_IMAGES={int(DOWNLOAD_ARTICLE_IMAGES)})")
 
-    _write_text(script_path, "\n".join(lines))
+    script_path.write_text("\n".join(txt), encoding="utf-8")
 
     meta = {
         "date_kst": kst.isoformat(),
         "run_id": run_id,
         "inputs": src,
         "shorts": shorts,
-        "images": ctx.get("images", {}),
+        "downloads": downloads,
         "files": {"script": str(script_path), "meta": str(meta_path)},
     }
-    _write_json(meta_path, meta)
-
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     ctx["outputs"] = {"script_path": str(script_path), "meta_path": str(meta_path)}
-    return "PRINT"
 
 
-def node_print(ctx: dict[str, Any]):
+def node_print(ctx: dict[str, Any]) -> None:
     log("TOPIC: " + ctx["inputs"]["topic"])
-    log("SOURCE_URL: " + ctx["inputs"]["source_url"])
-    log("GENERATOR: " + str(ctx["shorts"].get("_generator")))
-    if "images" in ctx and isinstance(ctx["images"], dict):
-        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
-        log(f"IMAGES: {ok}/6 -> outputs/images/")
+    log("PEOPLE: " + ", ".join(ctx["shorts"].get("people", [])))
     log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
     log("META FILE: " + ctx["outputs"]["meta_path"])
-    return None
+    log("IMAGES DIR: outputs/images/")
 
 
-# ===========================
-# 연결/실행
-# ===========================
-flow = Flow()
-flow.add(Node("LOAD_INPUTS", node_load_inputs))
-flow.add(Node("MAKE_SCRIPT", node_make_script))
-flow.add(Node("COLLECT_IMAGES", node_collect_images))
-flow.add(Node("SAVE_FILES", node_save_files))
-flow.add(Node("PRINT", node_print))
+def build_flow() -> Flow:
+    flow = Flow()
+    flow.add(Node("LOAD_INPUTS", node_load_inputs))
+    flow.add(Node("MAKE_SCRIPT", node_make_script))
+    flow.add(Node("DOWNLOAD_IMAGES", node_download_images))
+    flow.add(Node("SAVE_FILES", node_save_files))
+    flow.add(Node("PRINT", node_print))
 
-flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
-flow.connect("MAKE_SCRIPT", "COLLECT_IMAGES")
-flow.connect("COLLECT_IMAGES", "SAVE_FILES")
-flow.connect("SAVE_FILES", "PRINT")
+    flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
+    flow.connect("MAKE_SCRIPT", "DOWNLOAD_IMAGES")
+    flow.connect("DOWNLOAD_IMAGES", "SAVE_FILES")
+    flow.connect("SAVE_FILES", "PRINT")
+    return flow
+
 
 if __name__ == "__main__":
     try:
-        flow.run("LOAD_INPUTS")
+        build_flow().run("LOAD_INPUTS")
         log("\n[끝] OK")
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
-
-
