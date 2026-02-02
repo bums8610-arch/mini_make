@@ -36,7 +36,8 @@ UA = os.getenv(
 )
 
 # OpenAI
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+env:
+  OPENAI_MODEL: "gpt-5.2"
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 
 # 이미지 수집 옵션
@@ -922,3 +923,4 @@ if __name__ == "__main__":
     except Exception:
         _write_text(OUT_DIR / "error.txt", traceback.format_exc())
         raise
+
