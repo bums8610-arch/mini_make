@@ -2,783 +2,758 @@
 from __future__ import annotations
 
 import os
-import re
 import json
-import time
 import random
-import hashlib
-import logging
-import argparse
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
 
-import requests
-
-# Optional: playwright for dynamic pages (kept for parity with original)
 from playwright.sync_api import sync_playwright
 
 
-# ----------------------------
-# Logging
-# ----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger("mini_make")
+# ===========================
+# 설정
+# ===========================
+OUT_DIR = Path("outputs")
+IMG_DIR = OUT_DIR / "images"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+IMG_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ----------------------------
-# Config
-# ----------------------------
-KST = ZoneInfo("Asia/Seoul")
-
-NAVER_RANKING_URL = os.getenv(
-    "NAVER_RANKING_URL", "https://m.entertain.naver.com/ranking"
+RANKING_URL = "https://m.entertain.naver.com/ranking"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-USE_OPENAI = os.getenv("USE_OPENAI", "0").strip() in ("1", "true", "True", "YES", "yes")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "25"))
 
-# Wikimedia/Commons settings
-COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-
-COMMONS_THUMB_WIDTH = int(os.getenv("COMMONS_THUMB_WIDTH", "1080"))
-COMMONS_SEARCH_LIMIT = int(os.getenv("COMMONS_SEARCH_LIMIT", "12"))
-COMMONS_P18_LIMIT = int(os.getenv("COMMONS_P18_LIMIT", "10"))
-
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
-MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "30"))
-RANDOM_SEED = os.getenv("RANDOM_SEED", "").strip()
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-
-# Beat structure for 60s short
-BEATS = [
-    {"id": 1, "t": "0-2s", "goal": "강한 훅"},
-    {"id": 2, "t": "2-10s", "goal": "상황/주인공 제시"},
-    {"id": 3, "t": "10-25s", "goal": "핵심 전개/포인트"},
-    {"id": 4, "t": "25-40s", "goal": "추가 정보/맥락"},
-    {"id": 5, "t": "40-55s", "goal": "정리/여운"},
-    {"id": 6, "t": "55-60s", "goal": "콜투액션"},
-]
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
+USE_OPENAI = os.getenv("USE_OPENAI", "1") == "1"
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
-def ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def now_kst_iso() -> str:
-    return datetime.now(tz=KST).isoformat(timespec="seconds")
+def now_kst() -> datetime:
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
 
 
-def safe_filename(s: str, max_len: int = 80) -> str:
-    s = re.sub(r"[^\w\-\.]+", "_", s, flags=re.UNICODE).strip("_")
-    if not s:
-        s = "item"
-    return s[:max_len]
+def _clean_text(s: Any) -> str:
+    if not isinstance(s, str):
+        return ""
+    return " ".join(s.replace("\u00a0", " ").split()).strip()
 
 
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text or "", encoding="utf-8")
 
 
-def http_get(url: str, headers: Optional[dict] = None, params: Optional[dict] = None) -> requests.Response:
-    return requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+def _write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def http_stream_download(url: str, out_path: str, headers: Optional[dict] = None) -> None:
-    with requests.get(url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
+def _http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
+    req = Request(url, headers=headers or {})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8"))
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return {"_error": True, "_status": int(getattr(e, "code", 0) or 0), "_url": url, "_body": body[:2000]}
+    except URLError as e:
+        return {"_error": True, "_status": 0, "_url": url, "_body": str(e)}
 
 
-def json_dump(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def score_photo(photo: dict[str, Any]) -> float:
+    """세로(9:16)에 가까울수록 + 해상도 높을수록 점수↑"""
+    try:
+        w = float(photo.get("width") or 0)
+        h = float(photo.get("height") or 0)
+    except Exception:
+        return 0.0
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    # portrait면 w/h ≈ 9/16(0.5625)이 이상적
+    ratio = w / h
+    target = 9.0 / 16.0
+    ratio_score = max(0.0, 1.0 - abs(ratio - target) * 2.0)
+
+    # 12MP(3000*4000)를 1.0 근처로
+    res_score = min(1.5, (w * h) / (3000 * 4000))
+    return ratio_score * 0.7 + res_score * 0.3
 
 
-def text_dump(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def _download(url: str, out_path: Path, timeout: int = 60) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "User-Agent": UA,
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+    }
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        out_path.write_bytes(data)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(f"download_failed status={getattr(e,'code',0)} url={url} body={body[:200]}") from e
+    except URLError as e:
+        raise RuntimeError(f"download_failed url={url} err={e}") from e
 
 
-# ----------------------------
-# Article scraping (Naver)
-# ----------------------------
+# ===========================
+# mini make (flow)
+# ===========================
 @dataclass
-class Article:
-    url: str
-    title: str = ""
-    description: str = ""
-    published: str = ""
-    content: str = ""
+class Node:
+    name: str
+    fn: callable
 
 
-def collect_naver_ranking_links(max_items: int = 30) -> List[str]:
-    """
-    Use Playwright to render mobile Naver ranking list and collect links.
-    """
-    links: List[str] = []
-    logger.info(f"[NAVER] goto {NAVER_RANKING_URL}")
+class Flow:
+    def __init__(self):
+        self.nodes: dict[str, Node] = {}
+        self.links: dict[str, str] = {}
+
+    def add(self, node: Node):
+        self.nodes[node.name] = node
+
+    def connect(self, a: str, b: str):
+        self.links[a] = b
+
+    def run(self, start: str):
+        ctx: dict[str, Any] = {}
+        cur = start
+        while cur is not None:
+            log(f"[실행] {cur}")
+            nxt = self.nodes[cur].fn(ctx)
+            cur = nxt if isinstance(nxt, str) else self.links.get(cur)
+        return ctx
+
+
+# ===========================
+# 네이버 랭킹에서 기사 랜덤 선택
+# ===========================
+def _walk_json(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+
+def _extract_items_from_json(obj) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for node in _walk_json(obj):
+        if not isinstance(node, dict):
+            continue
+
+        title = None
+        for k in ("title", "headline", "articleTitle", "subject", "newsTitle", "name"):
+            v = node.get(k)
+            if isinstance(v, str):
+                s = v.strip()
+                if 6 <= len(s) <= 120:
+                    title = s
+                    break
+
+        url = None
+        for k in ("url", "link", "href", "mobileUrl", "pcUrl"):
+            v = node.get(k)
+            if isinstance(v, str) and v.strip().startswith("http"):
+                url = v.strip()
+                break
+
+        if not url:
+            oid = node.get("oid") or node.get("officeId")
+            aid = node.get("aid") or node.get("articleId")
+            if oid and aid:
+                url = f"https://m.entertain.naver.com/home/article/{oid}/{aid}"
+
+        if title and url and "entertain.naver.com" in url:
+            out.append({"title": title, "url": url})
+
+    uniq = {}
+    for it in out:
+        uniq[it["title"] + "|" + it["url"]] = it
+    return list(uniq.values())
+
+
+def pick_topic_from_naver_entertain_random() -> tuple[str, str, str]:
+    json_items: list[dict[str, str]] = []
+    json_urls: list[str] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(NAVER_RANKING_URL, wait_until="networkidle", timeout=60_000)
-        page.wait_for_timeout(1500)
-
-        # Collect anchors under ranking list
-        anchors = page.query_selector_all("a[href]")
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            if not href:
-                continue
-            # target article links
-            if "/read" in href or "/article" in href:
-                if href.startswith("/"):
-                    href = "https://m.entertain.naver.com" + href
-                if href.startswith("https://"):
-                    links.append(href)
-
-        browser.close()
-
-    # Dedup while preserving order
-    seen = set()
-    uniq = []
-    for u in links:
-        if u in seen:
-            continue
-        seen.add(u)
-        uniq.append(u)
-
-    logger.info(f"[NAVER] items={len(uniq)}")
-    return uniq[:max_items]
-
-
-def fetch_article(url: str) -> Article:
-    """
-    Fetch article HTML and parse OG meta and a rough text body (best-effort).
-    For robustness we use requests (no JS); Naver mobile pages usually have OG tags.
-    """
-    logger.info(f"[ARTICLE] fetch {url}")
-    r = http_get(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; mini_make/1.0; +https://example.com)"
-        },
-    )
-    r.raise_for_status()
-    html = r.text
-
-    def og(prop: str) -> str:
-        # property="og:title" content="..."
-        m = re.search(
-            rf'property="{re.escape(prop)}"\s+content="([^"]*)"', html, flags=re.I
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
-        return (m.group(1).strip() if m else "")
+        context = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 1280, "height": 720},
+            user_agent=UA,
+        )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        page = context.new_page()
 
-    title = og("og:title")
-    desc = og("og:description")
-    published = ""
+        def on_response(resp):
+            try:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "application/json" in ct:
+                    json_urls.append(resp.url)
+                    try:
+                        data = resp.json()
+                        json_items.extend(_extract_items_from_json(data))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
-    # Try to find published time (varies)
-    m = re.search(r'data-date-time="([^"]+)"', html)
-    if m:
-        published = m.group(1).strip()
-    else:
-        m = re.search(r'"publishedTime"\s*:\s*"([^"]+)"', html)
-        if m:
-            published = m.group(1).strip()
+        page.on("response", on_response)
 
-    # crude body extraction: remove scripts/styles, then pick larger text blocks
-    body = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
-    body = re.sub(r"(?is)<br\s*/?>", "\n", body)
-    body = re.sub(r"(?is)<[^>]+>", " ", body)
-    body = re.sub(r"&nbsp;", " ", body)
-    body = re.sub(r"\s+", " ", body).strip()
+        try:
+            log(f"[네이버] goto {RANKING_URL}")
+            page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
 
-    # limit
-    content = body[:2000]
+            # 스크롤로 더 로딩 유도
+            for _ in range(3):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1200)
 
-    return Article(url=url, title=title, description=desc, published=published, content=content)
+            dom_items = page.evaluate(
+                """() => {
+                    const out = [];
+                    const links = Array.from(document.querySelectorAll('a'));
+                    for (const a of links) {
+                      const rawHref = a.getAttribute('href') || '';
+                      const href = rawHref ? new URL(rawHref, location.origin).href : '';
+                      const text = ((a.innerText || a.textContent || '')).trim().replace(/\\s+/g,' ');
+                      if (!href || !text) continue;
+
+                      const okDomain = href.includes('entertain.naver.com');
+                      const okPath = href.includes('/article/') || href.includes('/home/article/') || href.includes('/ranking/read');
+                      if (okDomain && okPath && text.length >= 6 && text.length <= 120) {
+                        out.push({title: text, url: href});
+                      }
+                    }
+                    const uniq = new Map();
+                    for (const x of out) uniq.set(x.title + '|' + x.url, x);
+                    return Array.from(uniq.values());
+                }"""
+            ) or []
+
+            # __NEXT_DATA__ 파싱(파이썬 json.loads만 사용)
+            next_data_text = page.evaluate(
+                """() => {
+                    const el = document.querySelector('#__NEXT_DATA__');
+                    return el ? el.textContent : '';
+                }"""
+            )
+            next_items: list[dict[str, str]] = []
+            if next_data_text and isinstance(next_data_text, str) and len(next_data_text) > 50:
+                try:
+                    next_json = json.loads(next_data_text)
+                    next_items = _extract_items_from_json(next_json)
+                except Exception:
+                    next_items = []
+
+            # 합치기/중복제거
+            all_map = {}
+            for it in (json_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
+            for it in (next_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
+            for it in (dom_items or []):
+                all_map[it["title"] + "|" + it["url"]] = it
+
+            all_items = list(all_map.values())
+            log(f"[네이버] items={len(all_items)}")
+
+            if not all_items:
+                _write_text(OUT_DIR / "naver_debug.html", page.content())
+                page.screenshot(path=str(OUT_DIR / "naver_debug.png"), full_page=True)
+                _write_text(OUT_DIR / "naver_json_urls.txt", "\n".join(json_urls[:500]))
+                raise RuntimeError("기사 링크를 찾지 못했습니다. outputs/naver_debug.* 확인 필요")
+
+            chosen = random.choice(all_items)
+            return chosen["title"], chosen["url"], RANKING_URL
+
+        finally:
+            context.close()
+            browser.close()
 
 
-# ----------------------------
-# OpenAI (optional)
-# ----------------------------
-def openai_chat_json(system: str, user: str) -> Optional[dict]:
-    """
-    Minimal OpenAI Chat Completions call (best-effort).
-    Uses the Responses API shape? The original likely used chat.completions; keep simple.
-    """
-    if not (USE_OPENAI and OPENAI_API_KEY):
-        return None
+# ===========================
+# 기사 컨텍스트(OG + 본문 일부)
+# ===========================
+def fetch_article_context(article_url: str) -> dict[str, Any]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1280, "height": 720})
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        page = context.new_page()
 
-    try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": OPENAI_MODEL,
-            "temperature": 0.7,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except Exception as e:
-        logger.warning(f"[OPENAI] failed: {e}")
-        return None
+        try:
+            page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+
+            data = page.evaluate(
+                """() => {
+                    function metaBy(sel) {
+                      const el = document.querySelector(sel);
+                      return el ? (el.getAttribute('content') || '') : '';
+                    }
+                    function pickBody() {
+                      const selectors = ['#articleBodyContents','div#dic_area','div._article_content','div.article_body','article','main'];
+                      let best = '';
+                      for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const t = (el.innerText || '').trim();
+                        if (t.length > best.length) best = t;
+                      }
+                      if (!best) best = (document.body && document.body.innerText) ? document.body.innerText : '';
+                      return best;
+                    }
+
+                    const og_title = metaBy('meta[property="og:title"]');
+                    const og_description = metaBy('meta[property="og:description"]');
+                    const published = metaBy('meta[property="article:published_time"]') || metaBy('meta[name="article:published_time"]');
+                    const body = pickBody();
+                    return { og_title, og_description, published_time: published, body_text: body };
+                }"""
+            )
+
+            return {
+                "final_url": page.url,
+                "og_title": _clean_text(data.get("og_title", ""))[:200],
+                "og_description": _clean_text(data.get("og_description", ""))[:300],
+                "published_time": _clean_text(data.get("published_time", ""))[:60],
+                "body_snippet": _clean_text(data.get("body_text", ""))[:1200],
+            }
+        finally:
+            context.close()
+            browser.close()
 
 
-# ----------------------------
-# Script + Person extraction
-# ----------------------------
-def build_script(article: Article) -> dict:
-    """
-    Return a dict containing:
-      - short_title
-      - script: list of beats with {t, caption, narration, keywords}
-      - people: list of person name strings
-    """
+# ===========================
+# 대본 생성: 템플릿(폴백)
+# ===========================
+def build_60s_shorts_script_template(inputs: dict[str, Any]) -> dict[str, Any]:
+    topic = inputs["topic"]
+    beats = [
+        {"t": "0-2s", "voice": f"오늘 연예 랭킹 한 줄 요약! {topic}", "onscreen": "오늘 랭킹", "broll": "ranking scroll"},
+        {"t": "2-10s", "voice": "왜 뜨는지 제목/요약 기준으로 핵심만 볼게요.", "onscreen": "왜 뜸?", "broll": "news keywords"},
+        {"t": "10-25s", "voice": "포인트 1. 사람들이 멈춰보는 키워드가 있어요.", "onscreen": "포인트1", "broll": "headline highlight"},
+        {"t": "25-40s", "voice": "포인트 2. 댓글·공유가 생길 포인트가 보여요.", "onscreen": "포인트2", "broll": "social comments"},
+        {"t": "40-55s", "voice": "포인트 3. 다음 이슈로 이어질 흐름이 보입니다.", "onscreen": "포인트3", "broll": "news collage"},
+        {"t": "55-60s", "voice": "내일 랭킹도 자동으로 정리할게요. 구독!", "onscreen": "구독!", "broll": "subscribe button"},
+    ]
+    return {
+        "_generator": "template",
+        "topic": topic,
+        "title_short": topic[:28],
+        "description": "네이버 연예 랭킹 기반 요약(제목/요약 기준)",
+        "beats": beats,
+        "hashtags": ["#연예", "#네이버", "#랭킹", "#쇼츠", "#자동화"],
+        "notes": "정보가 부족한 부분은 '제목/요약 기준'으로 표현",
+    }
+
+
+# ===========================
+# 대본 생성: OpenAI(구조화 JSON) + 폴백
+# ===========================
+def build_60s_shorts_script_openai(inputs: dict[str, Any]) -> dict[str, Any]:
+    from openai import OpenAI
+
+    client = OpenAI()
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "topic": {"type": "string"},
+            "title_short": {"type": "string"},
+            "description": {"type": "string"},
+            "beats": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "t": {"type": "string"},
+                        "voice": {"type": "string"},
+                        "onscreen": {"type": "string"},
+                        "broll": {"type": "string"},
+                    },
+                    "required": ["t", "voice", "onscreen", "broll"],
+                },
+            },
+            "hashtags": {"type": "array", "items": {"type": "string"}, "minItems": 4, "maxItems": 10},
+            "notes": {"type": "string"},
+        },
+        "required": ["topic", "title_short", "description", "beats", "hashtags", "notes"],
+    }
+
     system = (
-        "You are a Korean short-form news scriptwriter. "
-        "Return compact JSON only. No markdown."
+        "너는 한국어 유튜브 쇼츠(약 60초) 대본 작가다. "
+        "입력(제목/OG설명/본문발췌/링크) 밖의 사실을 단정하지 말고, 불확실하면 '제목/요약 기준'이라고 표현해라. "
+        "과장/루머/비방 금지. "
+        "정확히 6구간(0-2s, 2-10s, 10-25s, 25-40s, 40-55s, 55-60s). "
+        "onscreen은 12자 이내, voice는 짧고 말로 읽기 좋게."
     )
-    user = {
-        "task": "Generate a 60-second YouTube Shorts script with 6 beats.",
-        "format": {
-            "short_title": "string",
-            "people": ["string"],
-            "beats": [
-                {
-                    "id": "1..6",
-                    "time": "e.g. 0-2s",
-                    "caption": "On-screen caption (Korean, short)",
-                    "narration": "Voiceover (Korean, natural)",
-                    "keywords": ["visual keywords", "for image search"],
-                }
-            ],
+
+    user_payload = {
+        "topic": inputs["topic"],
+        "source_url": inputs["source_url"],
+        "ranking_page": inputs["ranking_page"],
+        "article_context": inputs.get("article_context", {}),
+    }
+
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        text={"format": {"type": "json_schema", "name": "shorts_script", "strict": True, "schema": schema}},
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+    )
+
+    data = json.loads(resp.output_text)
+    data["_generator"] = f"openai:{OPENAI_MODEL}"
+
+    # 최소 정리
+    for b in data.get("beats", []):
+        b["t"] = _clean_text(b.get("t", ""))[:20]
+        b["voice"] = _clean_text(b.get("voice", ""))[:220]
+        b["onscreen"] = _clean_text(b.get("onscreen", ""))[:12]
+        b["broll"] = _clean_text(b.get("broll", ""))[:80]
+    return data
+
+
+# ===========================
+# 이미지 수집: Pexels
+# ===========================
+PEXELS_LAST_ERROR: dict[str, Any] | None = None
+
+
+def pexels_search(query: str, per_page: int = 25) -> list[dict[str, Any]]:
+    global PEXELS_LAST_ERROR
+    PEXELS_LAST_ERROR = None
+
+    if not PEXELS_API_KEY:
+        PEXELS_LAST_ERROR = {"_error": True, "_status": 0, "_body": "missing_api_key"}
+        return []
+
+    url = (
+        "https://api.pexels.com/v1/search"
+        f"?query={quote_plus(query)}&per_page={per_page}&orientation=portrait"
+    )
+    headers = {
+        "Authorization": PEXELS_API_KEY,
+        "User-Agent": UA,
+        "Accept": "application/json",
+    }
+    data = _http_json(url, headers=headers, timeout=30)
+
+    if isinstance(data, dict) and data.get("_error"):
+        PEXELS_LAST_ERROR = data
+        _write_json(OUT_DIR / "pexels_api_error.json", data)
+        return []
+
+    photos = (data or {}).get("photos", []) if isinstance(data, dict) else []
+    return photos or []
+
+
+def build_image_queries_fallback(beats: list[dict[str, Any]]) -> list[str]:
+    base = [
+        "people reading entertainment news on phone",
+        "reporter writing celebrity news article",
+        "trending news headline on smartphone screen",
+        "social media comments scrolling close up",
+        "entertainment news collage montage",
+        "subscribe button on screen close up",
+    ]
+    return base[:6] if len(beats) >= 6 else base[: max(1, len(beats))]
+
+
+def generate_image_queries_openai(shorts: dict[str, Any]) -> list[str]:
+    from openai import OpenAI
+
+    client = OpenAI()
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "queries": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {"type": "string"},
+            }
         },
-        "article": {
-            "title": article.title,
-            "description": article.description,
-            "published": article.published,
-            "content": article.content,
-            "url": article.url,
-        },
-        "constraints": [
-            "No defamation. Use cautious wording like '보도에 따르면', '추정된다' when uncertain.",
-            "Avoid quoting long text from the article.",
-            "Keep each beat narration 1-2 sentences max.",
-            "keywords should be nouns, 2-6 items per beat.",
-            "people should include likely related person names if any, else empty list.",
+        "required": ["queries"],
+    }
+
+    system = (
+        "너는 영상 편집자다. Pexels에서 잘 검색되는 영어 검색어 6개를 만들어라. "
+        "각 검색어는 4~8단어, 장면(인물/장소/행동)이 떠오르게. "
+        "실명/로고/스크린샷/워터마크 유도 단어는 피한다."
+    )
+
+    beats = shorts.get("beats") or []
+    payload = {
+        "topic": shorts.get("topic", ""),
+        "beats": [
+            {
+                "t": b.get("t", ""),
+                "voice": (b.get("voice", "") or "")[:120],
+                "onscreen": b.get("onscreen", ""),
+                "broll": b.get("broll", ""),
+            }
+            for b in beats
         ],
     }
 
-    j = openai_chat_json(system, json.dumps(user, ensure_ascii=False))
-    if j and isinstance(j, dict) and "beats" in j:
-        return {
-            "short_title": j.get("short_title") or article.title[:40],
-            "people": [p for p in (j.get("people") or []) if isinstance(p, str) and p.strip()],
-            "beats": j.get("beats"),
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        text={"format": {"type": "json_schema", "name": "image_queries", "strict": True, "schema": schema}},
+        max_output_tokens=300,
+    )
+    data = json.loads(resp.output_text)
+    queries = [_clean_text(q)[:90] for q in data["queries"]]
+    if len(queries) != 6:
+        raise RuntimeError("OpenAI image queries length != 6")
+    return queries
+
+
+def collect_images_from_pexels(ctx: dict[str, Any]) -> dict[str, Any]:
+    topic = ctx["inputs"]["topic"]
+    beats = ctx["shorts"]["beats"]
+
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY가 없습니다. GitHub Secrets에 PEXELS_API_KEY를 추가하세요.")
+
+    queries: list[str] | None = None
+
+    # OpenAI로 쿼리 생성(가능하면)
+    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
+        try:
+            queries = generate_image_queries_openai(ctx["shorts"])
+            _write_json(OUT_DIR / "image_queries.json", {"source": "openai", "queries": queries})
+        except Exception as e:
+            _write_text(OUT_DIR / "image_query_error.txt", str(e))
+            queries = None
+
+    # 폴백
+    if not queries:
+        queries = build_image_queries_fallback(beats)
+        _write_json(OUT_DIR / "image_queries.json", {"source": "fallback", "queries": queries})
+
+    results: list[dict[str, Any]] = []
+    files: list[str] = []
+
+    for i in range(6):
+        q = queries[i]
+        log(f"[PEXELS] beat{i+1} query={q}")
+
+        photos = pexels_search(q, per_page=PEXELS_PER_PAGE)
+        if not photos:
+            results.append({"beat": i + 1, "query": q, "ok": False, "reason": "no_results_or_error"})
+            continue
+
+        ranked = sorted(photos, key=score_photo, reverse=True)
+        pick = random.choice(ranked[: min(3, len(ranked))])  # 상위 3개 중 랜덤
+
+        src = pick.get("src") or {}
+        dl = src.get("large2x") or src.get("large") or src.get("original")
+        if not dl:
+            results.append({"beat": i + 1, "query": q, "ok": False, "reason": "no_download_url"})
+            continue
+
+        out_path = IMG_DIR / f"beat{i+1:02d}_pexels_{pick.get('id')}.jpg"
+        _download(dl, out_path, timeout=60)
+
+        rec = {
+            "beat": i + 1,
+            "query": q,
+            "ok": True,
+            "provider": "pexels",
+            "file": str(out_path),
+            "id": pick.get("id"),
+            "page_url": pick.get("url"),
+            "photographer": pick.get("photographer"),
+            "photographer_url": pick.get("photographer_url"),
+            "download_url": dl,
+            "w": pick.get("width"),
+            "h": pick.get("height"),
+            "score": score_photo(pick),
         }
+        results.append(rec)
+        files.append(str(out_path))
 
-    # Fallback template
-    fallback_beats = []
-    for b in BEATS:
-        fallback_beats.append(
-            {
-                "id": b["id"],
-                "time": b["t"],
-                "caption": article.title[:18],
-                "narration": f"{article.title}. {article.description}"[:120],
-                "keywords": ["entertainment", "celebrity", "news", "Korea"],
-            }
-        )
-
-    people = heuristic_people_from_text(article.title + " " + article.description)
-    return {
-        "short_title": article.title[:40] if article.title else "쇼츠 뉴스",
-        "people": people,
-        "beats": fallback_beats,
-    }
-
-
-def heuristic_people_from_text(text: str) -> List[str]:
-    """
-    Very rough heuristic for Korean person names:
-    - Finds 2~4 Korean syllables sequences, avoids common words.
-    - Dedup and return top few.
-    """
-    if not text:
-        return []
-    cands = re.findall(r"[가-힣]{2,4}", text)
-    stop = {
-        "오늘", "연예", "뉴스", "공개", "논란", "근황", "소식", "사진", "영상",
-        "공식", "입장", "드라마", "영화", "가수", "배우", "아이돌", "결혼",
-        "이별", "사과", "해명", "발표", "방송", "출연", "컴백",
-    }
-    out = []
-    for c in cands:
-        if c in stop:
-            continue
-        if len(c) == 2 and c.endswith("들"):
-            continue
-        if c not in out:
-            out.append(c)
-    # Keep only a few
-    return out[:4]
-
-
-# ----------------------------
-# Wikimedia Commons / Wikidata image fetcher (copyright-safe sources)
-# ----------------------------
-@dataclass
-class CommonsImage:
-    title: str  # "File:xxx.jpg"
-    page_url: str
-    thumb_url: str
-    orig_url: Optional[str]
-    license_short: Optional[str]
-    license_url: Optional[str]
-    author: Optional[str]
-    credit: Optional[str]
-
-
-def wikidata_search_entity(query: str, limit: int = 5) -> List[dict]:
-    params = {
-        "action": "wbsearchentities",
-        "search": query,
-        "language": "ko",
-        "format": "json",
-        "limit": limit,
-    }
-    r = http_get(WIKIDATA_API, params=params)
-    r.raise_for_status()
-    return (r.json().get("search") or [])
-
-
-def wikidata_get_claim_p18(entity_id: str, limit: int = 10) -> List[str]:
-    """
-    P18: image filename on Commons (without 'File:' prefix sometimes)
-    """
-    params = {
-        "action": "wbgetentities",
-        "ids": entity_id,
-        "props": "claims",
-        "format": "json",
-    }
-    r = http_get(WIKIDATA_API, params=params)
-    r.raise_for_status()
-    entities = r.json().get("entities") or {}
-    ent = entities.get(entity_id) or {}
-    claims = ent.get("claims") or {}
-    p18 = claims.get("P18") or []
-    files = []
-    for c in p18[:limit]:
-        mainsnak = c.get("mainsnak") or {}
-        datavalue = mainsnak.get("datavalue") or {}
-        value = datavalue.get("value")
-        if isinstance(value, str) and value.strip():
-            files.append(value.strip())
-    return files
-
-
-def commons_get_imageinfo(file_titles: List[str]) -> List[CommonsImage]:
-    """
-    For each file title, fetch imageinfo including URLs and extmetadata.
-    """
-    if not file_titles:
-        return []
-
-    # Normalize titles to "File:..."
-    norm = []
-    for t in file_titles:
-        t = t.strip()
-        if not t:
-            continue
-        if not t.lower().startswith("file:"):
-            t = "File:" + t
-        norm.append(t)
-
-    params = {
-        "action": "query",
-        "titles": "|".join(norm),
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": str(COMMONS_THUMB_WIDTH),
-        "format": "json",
-    }
-    r = http_get(COMMONS_API, params=params)
-    r.raise_for_status()
-    data = r.json()
-    pages = (data.get("query") or {}).get("pages") or {}
-    out: List[CommonsImage] = []
-
-    for _, page in pages.items():
-        title = page.get("title") or ""
-        pageid = page.get("pageid")
-        page_url = f"https://commons.wikimedia.org/?curid={pageid}" if pageid else ""
-        infos = page.get("imageinfo") or []
-        if not infos:
-            continue
-        ii = infos[0]
-        thumb_url = ii.get("thumburl") or ""
-        orig_url = ii.get("url")
-        ext = (ii.get("extmetadata") or {})
-
-        # Read license metadata if present
-        license_short = _ext_value(ext, "LicenseShortName")
-        license_url = _ext_value(ext, "LicenseUrl")
-        author = _ext_value(ext, "Artist")
-        credit = _ext_value(ext, "Credit")
-
-        out.append(
-            CommonsImage(
-                title=title,
-                page_url=page_url,
-                thumb_url=thumb_url,
-                orig_url=orig_url,
-                license_short=license_short,
-                license_url=license_url,
-                author=author,
-                credit=credit,
-            )
-        )
-    return out
-
-
-def _ext_value(ext: Dict[str, Any], key: str) -> Optional[str]:
-    v = ext.get(key) or {}
-    if isinstance(v, dict):
-        val = v.get("value")
-        if isinstance(val, str):
-            # remove html tags
-            val = re.sub(r"(?is)<[^>]+>", "", val).strip()
-            return val or None
-    return None
-
-
-def commons_search_files(query: str, limit: int = 12) -> List[str]:
-    """
-    Search commons files by text query. Returns file titles.
-    """
-    params = {
-        "action": "query",
-        "list": "search",
-        "srsearch": f'filetype:bitmap {query}',
-        "srnamespace": "6",  # File:
-        "srlimit": str(limit),
-        "format": "json",
-    }
-    r = http_get(COMMONS_API, params=params)
-    r.raise_for_status()
-    items = (r.json().get("query") or {}).get("search") or []
-    titles = []
-    for it in items:
-        t = it.get("title")
-        if isinstance(t, str) and t.lower().startswith("file:"):
-            titles.append(t)
-    return titles
-
-
-def is_license_allowed(img: CommonsImage) -> bool:
-    """
-    Conservative filter:
-    - Allow common CC and public domain-like licenses.
-    - Reject if license is missing.
-    """
-    ls = (img.license_short or "").lower()
-    if not ls:
-        return False
-
-    allow_tokens = [
-        "cc by", "cc-by", "cc by-sa", "cc-by-sa",
-        "public domain", "pd", "cc0",
-        "attribution", "share alike",
-    ]
-    deny_tokens = [
-        "fair use", "non-free", "all rights reserved", "arr",
-        "copyrighted", "restricted",
-    ]
-    for d in deny_tokens:
-        if d in ls:
-            return False
-    for a in allow_tokens:
-        if a in ls:
-            return True
-
-    # Some commons entries have "Creative Commons Attribution 4.0" etc
-    if "creative commons" in ls:
-        return True
-
-    return False
-
-
-def gather_images_for_people(people: List[str], need: int = 6) -> Tuple[List[CommonsImage], List[dict]]:
-    """
-    Collect Commons images using (1) Wikidata P18 then (2) Commons search.
-    Returns (images, debug_log).
-    """
-    images: List[CommonsImage] = []
-    debug: List[dict] = []
-
-    for name in people:
-        if len(images) >= need:
-            break
-        name = name.strip()
-        if not name:
-            continue
-
-        step = {"person": name, "wikidata_entities": [], "p18_files": [], "commons_search_files": [], "picked": []}
-
-        # 1) Wikidata entity search
-        entities = wikidata_search_entity(name, limit=5)
-        step["wikidata_entities"] = [{"id": e.get("id"), "label": e.get("label"), "desc": e.get("description")} for e in entities]
-
-        # 2) For each entity, try P18
-        p18_files: List[str] = []
-        for ent in entities:
-            eid = ent.get("id")
-            if not eid:
-                continue
-            p18 = wikidata_get_claim_p18(eid, limit=COMMONS_P18_LIMIT)
-            for f in p18:
-                if f not in p18_files:
-                    p18_files.append(f)
-        step["p18_files"] = p18_files
-
-        # 3) Resolve metadata and filter allowed licenses
-        imgs = commons_get_imageinfo(p18_files)
-        for img in imgs:
-            if len(images) >= need:
-                break
-            if is_license_allowed(img):
-                if not any(x.title == img.title for x in images):
-                    images.append(img)
-                    step["picked"].append(img.title)
-
-        if len(images) < need:
-            # 4) Commons search as fallback
-            # Add extra context tokens to bias toward portraits/photos
-            q = f'{name} portrait'
-            sfiles = commons_search_files(q, limit=COMMONS_SEARCH_LIMIT)
-            step["commons_search_files"] = sfiles
-
-            imgs2 = commons_get_imageinfo(sfiles)
-            for img in imgs2:
-                if len(images) >= need:
-                    break
-                if is_license_allowed(img):
-                    if not any(x.title == img.title for x in images):
-                        images.append(img)
-                        step["picked"].append(img.title)
-
-        debug.append(step)
-
-    return images[:need], debug
-
-
-def gather_generic_news_images(article: Article, need: int = 6) -> Tuple[List[CommonsImage], List[str]]:
-    """
-    If no people found, search commons with generic queries built from article title/desc keywords.
-    """
-    text = f"{article.title} {article.description}".strip()
-    # crude keyword extraction: keep korean/english tokens longer than 2
-    tokens = re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", text)
-    tokens = [t for t in tokens if len(t) >= 2]
-    # reduce and dedup
-    seen = set()
-    kws = []
-    for t in tokens:
-        if t in seen:
-            continue
-        seen.add(t)
-        kws.append(t)
-    if not kws:
-        kws = ["Korea", "entertainment", "celebrity"]
-
-    queries = [
-        " ".join(kws[:3]) + " photo",
-        " ".join(kws[:2]) + " portrait",
-        "Korean celebrity portrait",
-        "red carpet photo",
-    ]
-
-    images: List[CommonsImage] = []
-    used_titles = set()
-    used_queries: List[str] = []
-
-    for q in queries:
-        if len(images) >= need:
-            break
-        used_queries.append(q)
-        files = commons_search_files(q, limit=COMMONS_SEARCH_LIMIT)
-        imgs = commons_get_imageinfo(files)
-        for img in imgs:
-            if len(images) >= need:
-                break
-            if is_license_allowed(img) and img.title not in used_titles:
-                images.append(img)
-                used_titles.add(img.title)
-
-    return images[:need], used_queries
-
-
-def download_commons_images(images: List[CommonsImage], out_dir: str) -> List[dict]:
-    """
-    Download thumb images (or original if thumb missing) to out_dir.
-    Returns manifest items with license/source.
-    """
-    ensure_dir(out_dir)
-    manifest: List[dict] = []
-
-    for idx, img in enumerate(images, start=1):
-        url = img.thumb_url or img.orig_url
-        if not url:
-            continue
-
-        ext = ".jpg"
-        m = re.search(r"\.(jpg|jpeg|png|webp)(?:\?|$)", url, flags=re.I)
-        if m:
-            ext = "." + m.group(1).lower()
-
-        fname = f"image_{idx:02d}{ext}"
-        path = os.path.join(out_dir, fname)
-
-        logger.info(f"[COMMONS] download {img.title} -> {fname}")
-        http_stream_download(url, path)
-
-        manifest.append(
-            {
-                "file": fname,
-                "source_page": img.page_url,
-                "commons_title": img.title,
-                "download_url": url,
-                "license_short": img.license_short,
-                "license_url": img.license_url,
-                "author": img.author,
-                "credit": img.credit,
-            }
-        )
-
+    manifest = {"topic": topic, "provider": "pexels", "images": results, "files": files}
+    _write_json(OUT_DIR / "images_manifest.json", manifest)
     return manifest
 
 
-# ----------------------------
-# Main pipeline
-# ----------------------------
-def run_pipeline() -> dict:
-    if RANDOM_SEED:
-        random.seed(RANDOM_SEED)
+# ===========================
+# 노드들
+# ===========================
+def node_load_inputs(ctx: dict[str, Any]):
+    title, article_url, ranking_url = pick_topic_from_naver_entertain_random()
+    ctx["inputs"] = {"topic": title, "source_url": article_url, "ranking_page": ranking_url}
+    try:
+        ctx["inputs"]["article_context"] = fetch_article_context(article_url)
+    except Exception as e:
+        ctx["inputs"]["article_context"] = {"error": str(e)}
+    return "MAKE_SCRIPT"
 
-    ensure_dir(OUTPUT_DIR)
 
-    # 1) collect ranking links
-    links = collect_naver_ranking_links(max_items=min(MAX_ARTICLES, 100))
-    if not links:
-        raise RuntimeError("No ranking links collected.")
+def node_make_script(ctx: dict[str, Any]):
+    inputs = ctx["inputs"]
 
-    # 2) pick random article
-    pick = random.choice(links)
-    article = fetch_article(pick)
+    if USE_OPENAI and os.getenv("OPENAI_API_KEY"):
+        try:
+            ctx["shorts"] = build_60s_shorts_script_openai(inputs)
+            return "COLLECT_IMAGES"
+        except Exception:
+            _write_text(OUT_DIR / "openai_error.txt", traceback.format_exc())
 
-    # 3) build script (OpenAI optional)
-    script_obj = build_script(article)
-    short_title = script_obj.get("short_title") or (article.title[:40] if article.title else "쇼츠 뉴스")
-    people = script_obj.get("people") or []
+    ctx["shorts"] = build_60s_shorts_script_template(inputs)
+    return "COLLECT_IMAGES"
 
-    # 4) build run folder
-    run_id = sha1(article.url + now_kst_iso())[:10]
-    run_dir = os.path.join(OUTPUT_DIR, f"{safe_filename(short_title)}_{run_id}")
-    ensure_dir(run_dir)
 
-    # Save article + script
-    json_dump(os.path.join(run_dir, "article.json"), article.__dict__)
-    json_dump(os.path.join(run_dir, "script.json"), script_obj)
+def node_collect_images(ctx: dict[str, Any]):
+    try:
+        ctx["images"] = collect_images_from_pexels(ctx)
+    except Exception:
+        _write_text(OUT_DIR / "images_error.txt", traceback.format_exc())
+        ctx["images"] = {"provider": "pexels", "ok": False, "error": "collect_images_failed"}
+    return "SAVE_FILES"
 
-    # Human-readable script
-    lines = []
-    lines.append(f"TITLE: {short_title}")
-    lines.append(f"URL: {article.url}")
-    if article.published:
-        lines.append(f"PUBLISHED: {article.published}")
+
+def node_save_files(ctx: dict[str, Any]):
+    kst = now_kst()
+    stamp = kst.strftime("%Y%m%d_%H%M")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+
+    script_path = OUT_DIR / f"shorts_{stamp}_{run_id}.txt"
+    meta_path = OUT_DIR / f"shorts_{stamp}_{run_id}.json"
+
+    src = ctx["inputs"]
+    shorts = ctx["shorts"]
+
+    lines: list[str] = []
+    lines.append(f"DATE(KST): {kst.isoformat()}")
+    lines.append(f"GENERATOR: {shorts.get('_generator')}")
+    lines.append(f"TOPIC: {shorts.get('topic')}")
+    lines.append(f"SOURCE_URL: {src.get('source_url')}")
+    lines.append(f"RANKING_PAGE: {src.get('ranking_page')}")
+
+    ac = src.get("article_context") or {}
+    lines.append(f"ARTICLE_OG_TITLE: {ac.get('og_title','')}")
+    lines.append(f"ARTICLE_OG_DESC: {ac.get('og_description','')}")
     lines.append("")
-    for b in script_obj.get("beats") or []:
-        lines.append(f"[{b.get('time')}] {b.get('caption')}")
-        lines.append(f"VO: {b.get('narration')}")
-        kws = b.get("keywords") or []
-        if kws:
-            lines.append(f"KW: {', '.join(kws)}")
+
+    for b in shorts.get("beats", []):
+        lines.append(f'[{b.get("t")}] {b.get("voice")}')
+        lines.append(f'  - ONSCREEN: {b.get("onscreen")}')
+        lines.append(f'  - BROLL: {b.get("broll")}')
+    lines.append("")
+    lines.append("HASHTAGS: " + " ".join(shorts.get("hashtags", [])))
+
+    if "images" in ctx and isinstance(ctx["images"], dict):
+        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
         lines.append("")
-    text_dump(os.path.join(run_dir, "script.txt"), "\n".join(lines).strip() + "\n")
+        lines.append(f"IMAGES: {ok}/6 -> outputs/images/")
+        lines.append("IMAGES_MANIFEST: outputs/images_manifest.json")
 
-    # 5) gather images from Wikimedia Commons (copyright-safe)
-    images: List[CommonsImage] = []
-    debug_log: Any = None
+    _write_text(script_path, "\n".join(lines))
 
-    if people:
-        logger.info(f"[IMAGES] people={people}")
-        images, debug_log = gather_images_for_people(people, need=6)
-
-    if len(images) < 6:
-        logger.info("[IMAGES] fallback to generic commons search")
-        more, used_queries = gather_generic_news_images(article, need=6 - len(images))
-        images.extend(more)
-        debug_log = {"people_debug": debug_log, "fallback_queries": used_queries}
-
-    # 6) download
-    img_dir = os.path.join(run_dir, "images")
-    manifest = download_commons_images(images[:6], img_dir)
-    json_dump(os.path.join(run_dir, "images_manifest.json"), manifest)
-    json_dump(os.path.join(run_dir, "images_debug.json"), debug_log)
-
-    # 7) return summary
-    summary = {
-        "run_dir": run_dir,
-        "short_title": short_title,
-        "article_url": article.url,
-        "people": people,
-        "images_count": len(manifest),
+    meta = {
+        "date_kst": kst.isoformat(),
+        "run_id": run_id,
+        "inputs": src,
+        "shorts": shorts,
+        "images": ctx.get("images", {}),
+        "files": {"script": str(script_path), "meta": str(meta_path)},
     }
-    json_dump(os.path.join(run_dir, "run_summary.json"), summary)
-    logger.info(f"[DONE] {summary}")
-    return summary
+    _write_json(meta_path, meta)
+
+    ctx["outputs"] = {"script_path": str(script_path), "meta_path": str(meta_path)}
+    return "PRINT"
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Run once and exit")
-    args = parser.parse_args()
+def node_print(ctx: dict[str, Any]):
+    log("TOPIC: " + ctx["inputs"]["topic"])
+    log("SOURCE_URL: " + ctx["inputs"]["source_url"])
+    log("GENERATOR: " + str(ctx["shorts"].get("_generator")))
+    if "images" in ctx and isinstance(ctx["images"], dict):
+        ok = sum(1 for x in (ctx["images"].get("images") or []) if x.get("ok"))
+        log(f"IMAGES: {ok}/6 -> outputs/images/")
+    log("SCRIPT FILE: " + ctx["outputs"]["script_path"])
+    log("META FILE: " + ctx["outputs"]["meta_path"])
+    return None
 
-    _ = run_pipeline()
 
-    if not args.once:
-        # compatibility: keep process alive if needed (default exit)
-        pass
+# ===========================
+# 연결/실행
+# ===========================
+flow = Flow()
+flow.add(Node("LOAD_INPUTS", node_load_inputs))
+flow.add(Node("MAKE_SCRIPT", node_make_script))
+flow.add(Node("COLLECT_IMAGES", node_collect_images))
+flow.add(Node("SAVE_FILES", node_save_files))
+flow.add(Node("PRINT", node_print))
 
+flow.connect("LOAD_INPUTS", "MAKE_SCRIPT")
+flow.connect("MAKE_SCRIPT", "COLLECT_IMAGES")
+flow.connect("COLLECT_IMAGES", "SAVE_FILES")
+flow.connect("SAVE_FILES", "PRINT")
 
 if __name__ == "__main__":
-    main()
+    try:
+        flow.run("LOAD_INPUTS")
+        log("\n[끝] OK")
+    except Exception:
+        _write_text(OUT_DIR / "error.txt", traceback.format_exc())
+        raise
+
+
 
