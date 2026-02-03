@@ -2,9 +2,8 @@ name: mini_make_daily
 
 on:
   schedule:
-    # KST 11:07,  (UTC = KST-9)
-     - cron: "7 2 * * *"
-     workflow_dispatch: {}
+    - cron: "0 2 * * *"   # UTC 02:00 = KST 11:00 (매일)
+  workflow_dispatch: {}   # (선택) 수동 실행 버튼
 
 jobs:
   run:
