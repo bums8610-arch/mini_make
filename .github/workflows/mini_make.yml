@@ -40,18 +40,21 @@ jobs:
           pip install openai playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run mini_make (make script/images/voice)
+      - name: Run mini_make (script + images + voice)
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: "gpt-5.2"
+          OPENAI_MAX_OUTPUT_TOKENS: "900"
+          OPENAI_TTS_MODEL: "gpt-4o-mini-tts"
+          OPENAI_TTS_VOICE: "marin"
         run: |
           set -euo pipefail
           mkdir -p outputs
           python -u mini_make.py 2>&1 | tee run.log
           test -s run.log || (echo "run.log empty -> FAIL" >&2; exit 1)
 
-      - name: Make video from existing images (8 images)
+      - name: Make video from existing images (8 images / 60s)
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +83,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${DISCORD_WEBHOOK:-}" ]; then exit 0; fi
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK not set -> skip"
+            exit 0
+          fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"❌ mini_make 실패! 확인 링크: $RUN_URL\"}" \
@@ -93,7 +99,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${DISCORD_WEBHOOK:-}" ]; then exit 0; fi
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK not set -> skip"
+            exit 0
+          fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           curl -H "Content-Type: application/json" \
             -d "{\"content\":\"✅ mini_make 성공! 로그 링크: $RUN_URL\"}" \
